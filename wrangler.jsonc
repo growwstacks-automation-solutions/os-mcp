@@ -1,0 +1,14 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "os-mcp",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-06-04",
+  // nodejs_compat: required by @neondatabase/serverless.
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true
+
+  // NO "vars" block. DATABASE_URL / MCP_AUTH_TOKEN are SECRETS:
+  //   wrangler secret put DATABASE_URL
+  //   wrangler secret put MCP_AUTH_TOKEN
+  // Locally they come from .dev.vars (gitignored).
+}

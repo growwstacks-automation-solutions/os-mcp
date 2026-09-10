@@ -1,0 +1,17 @@
+# Secrets — NEVER commit
+.dev.vars
+.env
+.env.*
+!.env.example
+
+# Deps / build
+node_modules/
+dist/
+.wrangler/
+
+# Misc
+.DS_Store
+*.log
+
+# Internal OS architecture brief - stays local, never in this repo
+GROWWSTACKS_OS_CONTEXT.md

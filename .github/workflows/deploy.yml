@@ -1,0 +1,41 @@
+name: Deploy
+
+# Push to main -> typecheck -> deploy to Cloudflare Workers.
+#
+# Runtime secrets (DATABASE_URL, MCP_AUTH_TOKEN, GS_ACTOR_UID) are NOT set here.
+# They live on the Worker itself, set once with `wrangler secret put`, and they
+# survive every redeploy. GitHub only needs credentials to *publish*.
+#
+# Required repository secrets (Settings > Secrets and variables > Actions):
+#   CLOUDFLARE_API_TOKEN   - a scoped token, see README
+#   CLOUDFLARE_ACCOUNT_ID  - 98d83a06d36ef8227913baaef4bda668
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: # lets you deploy by hand from the Actions tab
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # Don't let two pushes deploy over each other.
+    concurrency:
+      group: deploy-os-mcp
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      # A type error must stop the deploy, not ship broken SQL to production.
+      - run: npm run typecheck
+
+      - uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

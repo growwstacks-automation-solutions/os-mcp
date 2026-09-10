@@ -1,0 +1,27 @@
+# ---------------------------------------------------------------------------
+# os-mcp — LOCAL DEV SECRETS
+#
+# Wrangler reads this file automatically for `wrangler dev`. It is the Worker
+# equivalent of .env. It is gitignored and must NEVER be committed, pasted into
+# chat, or logged.
+#
+# For PRODUCTION do not use this file — run instead:
+#     wrangler secret put DATABASE_URL
+#     wrangler secret put MCP_AUTH_TOKEN
+# ---------------------------------------------------------------------------
+
+# Neon connection string.
+# 🚨 MUST be the NON-OWNER `app_user` role, not the Neon owner.
+#    No table in the OS schema sets FORCE ROW LEVEL SECURITY, so an owner
+#    connection bypasses all 55 RLS policies and app.current_user_id does
+#    nothing. app_user keeps RLS on.
+DATABASE_URL=postgresql://app_user:PASSWORD@HOST.neon.tech/DBNAME?sslmode=require
+
+# Shared bearer token the MCP requires on every request (the "front door").
+# Generate any long random string, e.g.:  openssl rand -hex 32
+MCP_AUTH_TOKEN=replace-with-a-long-random-string
+
+# UUID the MCP acts as for every call. Defaults to the OS SYSTEM user
+# (role=admin, active) if left blank. Change only if you mint a dedicated
+# U-SYS-MCP user row.
+GS_ACTOR_UID=00000000-0000-0000-0000-0000000000fe
