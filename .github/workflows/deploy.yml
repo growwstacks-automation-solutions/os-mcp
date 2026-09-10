@@ -10,9 +10,12 @@ name: Deploy
 #   CLOUDFLARE_API_TOKEN   - a scoped token, see README
 #   CLOUDFLARE_ACCOUNT_ID  - 98d83a06d36ef8227913baaef4bda668
 
+# OS-MCP is the working AND deploying branch: every push here goes live.
+# The typecheck step below is therefore the only gate between a commit and
+# production — keep it.
 on:
   push:
-    branches: [main]
+    branches: [OS-MCP]
   workflow_dispatch: # lets you deploy by hand from the Actions tab
 
 jobs:
