@@ -33,13 +33,26 @@ const fail = (message: string) => ({
   isError: true,
 });
 
-/** Wrap a handler so a thrown DB/RLS error becomes a readable tool error. */
+/**
+ * redact — strip anything credential-shaped out of an error before it leaves the
+ * Worker. The Neon driver puts the FULL connection string, password included,
+ * into its "not a valid URL" message; returning that verbatim would hand the
+ * database password to any caller. Belt and braces: also mask a bare
+ * user:pass@host and any postgres URL wherever it appears.
+ */
+function redact(msg: string): string {
+  return msg
+    .replace(/postgres(?:ql)?:\/\/[^\s"']*/gi, '[connection string redacted]')
+    .replace(/\/\/[^/\s:@]+:[^/\s@]+@/g, '//[credentials redacted]@');
+}
+
+/** Wrap a handler so a thrown DB/RLS error becomes a readable, safe tool error. */
 function guard<T>(fn: (args: T) => Promise<unknown>) {
   return async (args: T) => {
     try {
       return ok(await fn(args));
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
+      const msg = redact(e instanceof Error ? e.message : String(e));
       if (/violates row-level security|42501/i.test(msg)) {
         return fail(`Refused by the database (RLS): ${msg}`);
       }
@@ -70,6 +83,70 @@ const MILESTONE_STATUS = z.enum([
 ]);
 
 const PRIORITY = z.enum(['low', 'medium', 'high']);
+
+// ---------------------------------------------------------------------------
+// ASK-OR-SKIP
+//
+// The rule from the team: never assume a value, always ask — but let the user
+// say "skip" and take a documented default.
+//
+// An OPTIONAL field lets the model quietly omit it, which is exactly the silent
+// defaulting we're trying to stop. So these fields are REQUIRED but accept the
+// literal "skip". The model must therefore make a conscious choice on every one:
+// a real value it got from the user, or an explicit skip. It can never just
+// leave the field out.
+// ---------------------------------------------------------------------------
+const SKIP = 'skip' as const;
+
+/** Wrap a schema so it also accepts "skip", and say what skipping does. */
+function askOrSkip<T extends z.ZodTypeAny>(inner: T, ifSkipped: string) {
+  return z
+    .union([inner, z.literal(SKIP)])
+    .describe(
+      `REQUIRED — ask the user. If they don't want to give one, pass "skip" (${ifSkipped}). Never invent a value.`,
+    );
+}
+
+/** Unwrap an ask-or-skip value: "skip" (or absent) becomes null. */
+function val<T>(v: T | typeof SKIP | undefined): T | null {
+  return v === undefined || v === SKIP ? null : v;
+}
+
+/** Unwrap an ask-or-skip array: "skip" (or absent) becomes []. */
+function arrVal(v: string[] | typeof SKIP | undefined): string[] {
+  return v === undefined || v === SKIP ? [] : v;
+}
+
+// company_type (migration 0001). These are the business-facing words the team
+// already uses — "Client" and "Past Client" ARE the enum values here. Note this
+// is a DIFFERENT vocabulary from contact_status (prospect/active_client/…),
+// which describes a PERSON. A company is the account; a contact is a human.
+const COMPANY_TYPE = z.enum(['prospect', 'client', 'partner', 'past_client']);
+
+const COMPANY_SIZE = z.enum(['1-10', '11-50', '50-200', '200+']);
+
+/**
+ * resolveIndustry — map an industry name onto the controlled `industries` list
+ * (migration 0062). companies.industry is a trigger-maintained CACHE of the
+ * chosen row's name, so we must set industry_id, not the text column. Unknown
+ * names are rejected with the valid list rather than silently dropped.
+ */
+async function resolveIndustry(env: Env, name?: string): Promise<string | null> {
+  if (!name) return null;
+  const rows = await asUser<{ id: string; name: string }>(env, (sql) => sql`
+    SELECT id, name FROM industries WHERE archived_at IS NULL
+  `);
+  const hit = rows.find((r) => r.name.toLowerCase() === name.trim().toLowerCase());
+  if (!hit) {
+    throw new Error(
+      `Unknown industry "${name}". Valid options are: ${rows
+        .map((r) => r.name)
+        .sort()
+        .join(', ')}`,
+    );
+  }
+  return hit.id;
+}
 
 /**
  * normaliseApps — map free-text app names onto the project_app_catalog's
@@ -114,6 +191,174 @@ function changedFields(a: Record<string, unknown>, idKey: string): string[] {
 
 export function registerTools(server: ToolServer, env: Env): void {
   // =========================================================================
+  // 0. COMPANIES — the ACCOUNT. A contact is a person; a company is the
+  //    organisation they belong to. The "create a company" intake (name,
+  //    website, type, industry, size, location) lands here, NOT on a contact.
+  // =========================================================================
+  server.tool(
+    'create_company',
+    'Create a company (the client account). Ask the user for name and type first; website, industry, size and location are optional follow-ups.',
+    {
+      name: z.string().min(1).max(300).describe('REQUIRED. The company name.'),
+      type: COMPANY_TYPE.describe(
+        'REQUIRED. prospect | client | partner | past_client. ASK THE USER — do not guess.',
+      ),
+      website: askOrSkip(z.string().max(500), 'no website is recorded').describe(
+        'REQUIRED — ask the user for the website link. Pass "skip" if they do not have one.',
+      ),
+      industry: askOrSkip(z.string().max(200), 'no industry is recorded').describe(
+        'REQUIRED — ask the user for the industry, using a name from list_industries. Pass "skip" for none.',
+      ),
+      company_size: askOrSkip(COMPANY_SIZE, 'no size is recorded').describe(
+        'REQUIRED — ask the user for the headcount band: 1-10, 11-50, 50-200 or 200+. Pass "skip" for none.',
+      ),
+      location: askOrSkip(z.string().max(300), 'no location is recorded').describe(
+        'REQUIRED — ask the user for the location, e.g. "Indore, MP, India". Pass "skip" for none. Parsed into city/state/country.',
+      ),
+      account_owner_id: askOrSkip(z.string().uuid(), 'no account owner is set').describe(
+        'REQUIRED — ask the user who owns this account, then use find_user. Pass "skip" for none.',
+      ),
+      about: z.string().max(5000).optional(),
+    },
+    guard(async (a: any) => {
+      const industryId = await resolveIndustry(env, val<string>(a.industry) ?? undefined);
+      // "Indore, MP, India" -> city / state / country, last part first so a
+      // one-part answer lands in country rather than being dropped.
+      const parts = (val<string>(a.location) ?? '')
+        .split(',')
+        .map((p) => p.trim())
+        .filter(Boolean);
+      const country = parts.length >= 1 ? parts[parts.length - 1] : null;
+      const state = parts.length >= 3 ? parts[parts.length - 2] : null;
+      const city = parts.length >= 2 ? parts[0] : null;
+      const rows = await asUser(env, (sql) => sql`
+        INSERT INTO companies (
+          name, website, industry_id, company_size, city, state, country,
+          type, about, account_owner_id
+        )
+        VALUES (
+          ${a.name},
+          ${val<string>(a.website)},
+          ${industryId}::uuid,
+          ${val<string>(a.company_size)}::company_size,
+          ${city},
+          ${state},
+          ${country},
+          ${a.type}::company_type,
+          ${a.about ?? null},
+          ${val<string>(a.account_owner_id)}
+        )
+        RETURNING *
+      `);
+      if (rows.length === 0) {
+        throw new Error('Create not permitted (admin/pm only) or invalid input.');
+      }
+      return rows[0];
+    }),
+  );
+
+  server.tool(
+    'update_company',
+    'Update fields on a company. Only what you pass changes.',
+    {
+      company_id: z.string().uuid(),
+      name: z.string().min(1).max(300).optional(),
+      type: COMPANY_TYPE.optional(),
+      website: z.string().max(500).optional(),
+      industry: z.string().max(200).optional().describe('See list_industries.'),
+      company_size: COMPANY_SIZE.optional(),
+      city: z.string().max(100).optional(),
+      state: z.string().max(100).optional(),
+      country: z.string().max(100).optional(),
+      about: z.string().max(5000).optional(),
+      account_owner_id: z.string().uuid().optional(),
+      clear_fields: z
+        .array(z.enum(['website', 'industry', 'company_size', 'city', 'state',
+                       'country', 'about', 'account_owner_id']))
+        .optional(),
+    },
+    guard(async (a: any) => {
+      const given = changedFields(a, 'company_id');
+      const clear: string[] = a.clear_fields ?? [];
+      if (given.length === 0 && clear.length === 0) {
+        throw new Error('Pass at least one field to change or clear.');
+      }
+      const industryId = await resolveIndustry(env, a.industry);
+      const rows = await asUser(env, (sql) => sql`
+        UPDATE companies SET
+          name             = COALESCE(${a.name ?? null}, name),
+          type             = COALESCE(${a.type ?? null}::company_type, type),
+          website          = CASE WHEN 'website'          = ANY(${clear}::text[]) THEN NULL ELSE COALESCE(${a.website ?? null}, website) END,
+          industry_id      = CASE WHEN 'industry'         = ANY(${clear}::text[]) THEN NULL ELSE COALESCE(${industryId}::uuid, industry_id) END,
+          company_size     = CASE WHEN 'company_size'     = ANY(${clear}::text[]) THEN NULL ELSE COALESCE(${a.company_size ?? null}::company_size, company_size) END,
+          city             = CASE WHEN 'city'             = ANY(${clear}::text[]) THEN NULL ELSE COALESCE(${a.city ?? null}, city) END,
+          state            = CASE WHEN 'state'            = ANY(${clear}::text[]) THEN NULL ELSE COALESCE(${a.state ?? null}, state) END,
+          country          = CASE WHEN 'country'          = ANY(${clear}::text[]) THEN NULL ELSE COALESCE(${a.country ?? null}, country) END,
+          about            = CASE WHEN 'about'            = ANY(${clear}::text[]) THEN NULL ELSE COALESCE(${a.about ?? null}, about) END,
+          account_owner_id = CASE WHEN 'account_owner_id' = ANY(${clear}::text[]) THEN NULL ELSE COALESCE(${a.account_owner_id ?? null}::uuid, account_owner_id) END,
+          updated_at = now()
+        WHERE id = ${a.company_id}::uuid AND archived_at IS NULL
+        RETURNING id, display_id, name, type::text AS type, website, industry,
+                  company_size::text AS company_size, city, state, country, account_owner_id
+      `);
+      if (rows.length === 0) throw new Error('Update not permitted or company not found.');
+      return { updated: given, cleared: clear, company: rows[0] };
+    }),
+  );
+
+  server.tool(
+    'find_company',
+    'Find companies by name, website or display id. Use before create_company to avoid duplicates.',
+    {
+      query: z.string().min(1).max(200),
+      limit: z.number().int().min(1).max(100).default(20),
+    },
+    guard(async (a: any) => {
+      const like = `%${a.query}%`;
+      return asUser(env, (sql) => sql`
+        SELECT c.id, c.display_id, c.name, c.type::text AS type, c.website,
+               c.industry, c.company_size::text AS company_size,
+               c.city, c.state, c.country, c.account_owner_id,
+               u.full_name AS account_owner_name,
+               (SELECT count(*)::int FROM contacts ct
+                 WHERE ct.company_id = c.id AND ct.archived_at IS NULL) AS contact_count
+        FROM companies c
+        LEFT JOIN users u ON u.id = c.account_owner_id
+        WHERE c.archived_at IS NULL
+          AND (c.name ILIKE ${like} OR c.website ILIKE ${like} OR c.display_id ILIKE ${like})
+        ORDER BY c.created_at DESC
+        LIMIT ${a.limit ?? 20}
+      `);
+    }),
+  );
+
+  server.tool(
+    'set_company_owner',
+    'Set who owns a company account.',
+    { company_id: z.string().uuid(), user_id: z.string().uuid() },
+    guard(async (a: any) => {
+      const rows = await asUser(env, (sql) => sql`
+        UPDATE companies SET account_owner_id = ${a.user_id}::uuid, updated_at = now()
+        WHERE id = ${a.company_id}::uuid AND archived_at IS NULL
+        RETURNING id, display_id, name, account_owner_id
+      `);
+      if (rows.length === 0) throw new Error('Update not permitted or company not found.');
+      return rows[0];
+    }),
+  );
+
+  server.tool(
+    'list_industries',
+    'The controlled industry vocabulary. Call before create_company so you offer real options.',
+    {},
+    guard(async () =>
+      asUser(env, (sql) => sql`
+        SELECT id, name FROM industries WHERE archived_at IS NULL ORDER BY name
+      `),
+    ),
+  );
+
+  // =========================================================================
   // 1. CREATE CONTACT
   // =========================================================================
   server.tool(
@@ -121,21 +366,23 @@ export function registerTools(server: ToolServer, env: Env): void {
     'Create a contact (the CRM hub record) and its ownership row. ASK THE USER for status and owner if they have not said — never guess them.',
     {
       full_name: z.string().min(1).max(300).describe('Required. Full name of the person.'),
-      status: CONTACT_STATUS.describe(
-        'REQUIRED. The contact type. If the user has not said which, ASK THEM — do not default to prospect.',
+      status: askOrSkip(CONTACT_STATUS, 'defaults to "prospect"').describe(
+        'REQUIRED — ask the user: prospect, active_client, partner, on_hold or churned. Pass "skip" to default to "prospect". NOTE: this describes the PERSON; a COMPANY\'s type (prospect/client/partner/past_client) is set on create_company.',
       ),
-      primary_owner_id: z
-        .string()
-        .uuid()
-        .describe(
-          'REQUIRED. The user who owns this contact. If the user has not named an owner, ASK THEM, then use find_user to get the id. Do not silently assign it to the MCP system account.',
-        ),
+      primary_owner_id: askOrSkip(
+        z.string().uuid(),
+        'the MCP system account ends up owning it, which is usually wrong',
+      ).describe(
+        'REQUIRED — ask the user who owns this contact, then use find_user. Pass "skip" only if they genuinely have no owner in mind.',
+      ),
+      company_id: askOrSkip(z.string().uuid(), 'the contact has no company').describe(
+        'REQUIRED — ask which company this person belongs to, then use find_company. Pass "skip" for an individual with no company.',
+      ),
       email: z.string().email().max(300).optional(),
       phone: z.string().max(50).optional(),
-      company_id: z.string().uuid().optional().describe('Optional parent company.'),
     },
     guard(async (a: any) => {
-      const ownerId = a.primary_owner_id ?? actorUid(env);
+      const ownerId = val<string>(a.primary_owner_id) ?? actorUid(env);
       const rows = await asUser(env, (sql) => sql`
         WITH new_contact AS (
           INSERT INTO contacts (full_name, email, phone, company_id, status, primary_owner_id)
@@ -143,8 +390,8 @@ export function registerTools(server: ToolServer, env: Env): void {
             ${a.full_name},
             ${a.email ?? null},
             ${a.phone ?? null},
-            ${a.company_id ?? null},
-            COALESCE(${a.status ?? null}::contact_status, 'prospect'::contact_status),
+            ${val<string>(a.company_id)},
+            COALESCE(${val<string>(a.status)}::contact_status, 'prospect'::contact_status),
             ${ownerId}
           )
           RETURNING *
@@ -175,25 +422,28 @@ export function registerTools(server: ToolServer, env: Env): void {
         .describe(
           'REQUIRED. The pipeline stage the deal starts in, from list_pipelines. If the user has not said which stage, ASK THEM — do not default to the first stage.',
         ),
-      deal_value: z
-        .number()
-        .describe('REQUIRED. The deal amount. If the user has not given one, ASK THEM.'),
-      currency: z
-        .string()
-        .length(3)
-        .describe('REQUIRED. 3-letter code, e.g. "USD" or "INR". If not given, ASK THE USER.'),
-      source: z
-        .string()
-        .max(200)
-        .optional()
-        .describe(
-          'Where the lead came from, e.g. "LinkedIn", "Upwork", "Referral". NEVER invent or infer this. Ask the user, and if they do not know, leave it out entirely.',
-        ),
-      initial_deal_amount: z.number().optional(),
+      deal_value: askOrSkip(z.number(), 'no value is recorded').describe(
+        'REQUIRED — ask the user for the deal amount. Pass "skip" for none.',
+      ),
+      currency: askOrSkip(z.string().length(3), 'no currency is recorded').describe(
+        'REQUIRED — ask the user for the 3-letter code, e.g. USD or INR. Pass "skip" for none.',
+      ),
+      initial_deal_amount: askOrSkip(z.number(), 'no initial amount is recorded').describe(
+        'REQUIRED — ask the user for the initial amount. Pass "skip" for none.',
+      ),
+      lead_type: askOrSkip(z.string().max(200), 'no lead type is recorded').describe(
+        'REQUIRED — ask the user, e.g. "Inbound" or "Referral". NEVER infer it. Pass "skip" if they do not know.',
+      ),
+      source: askOrSkip(z.string().max(200), 'no source is recorded').describe(
+        'REQUIRED — ask the user where the lead came from, e.g. LinkedIn or Upwork. NEVER invent or infer it. Pass "skip" if they do not know.',
+      ),
+      primary_owner_id: askOrSkip(z.string().uuid(), 'the MCP system account owns it').describe(
+        'REQUIRED — ask the user who owns this deal, then use find_user. Pass "skip" for none.',
+      ),
+      close_date: askOrSkip(z.string(), 'no closing date is set').describe(
+        'REQUIRED — ask the user for the expected closing date (YYYY-MM-DD). Pass "skip" for none.',
+      ),
       payment_type: z.string().optional(),
-      close_date: z.string().optional().describe('YYYY-MM-DD'),
-      lead_type: z.string().max(200).optional().describe('e.g. "Inbound", "Outbound". Do not invent.'),
-      primary_owner_id: z.string().uuid().optional().describe('Deal owner; use find_user.'),
     },
     guard(async (a: any) => {
       // Resolve the stage: the caller's choice if it belongs to this pipeline,
@@ -216,7 +466,7 @@ export function registerTools(server: ToolServer, env: Env): void {
         throw new Error('That pipeline has no stages. Add a stage before placing deals in it.');
       }
 
-      const ownerId = a.primary_owner_id ?? actorUid(env);
+      const ownerId = val<string>(a.primary_owner_id) ?? actorUid(env);
       const rows = await asUser(env, (sql) => sql`
         WITH new_deal AS (
           INSERT INTO deals (
@@ -228,9 +478,9 @@ export function registerTools(server: ToolServer, env: Env): void {
             ${a.name},
             ${a.contact_id}::uuid,
             ${a.payment_type ?? null}::payment_type,
-            ${a.deal_value ?? null},
-            ${a.initial_deal_amount ?? null},
-            ${a.currency ?? null},
+            ${val<number>(a.deal_value)},
+            ${val<number>(a.initial_deal_amount)},
+            ${val<string>(a.currency)},
             -- Keep the legacy deal_stage enum in sync with the pipeline stage:
             -- use the stage's NAME when it is a valid enum label, else 'new'.
             COALESCE(
@@ -241,12 +491,12 @@ export function registerTools(server: ToolServer, env: Env): void {
                 WHERE ps.id = ${stageId}::uuid),
               'new'::deal_stage
             ),
-            ${a.close_date ?? null}::date,
+            ${val<string>(a.close_date)}::date,
             ${ownerId},
             ${a.pipeline_id}::uuid,
             ${stageId}::uuid,
-            ${a.lead_type || null},
-            ${a.source || null}
+            ${val<string>(a.lead_type)},
+            ${val<string>(a.source)}
           )
           -- Date columns as raw YYYY-MM-DD text (shadowing the * versions). The
           -- Neon driver otherwise returns a JS Date at UTC midnight, which reads
@@ -271,36 +521,53 @@ export function registerTools(server: ToolServer, env: Env): void {
     'Create a delivery project, optionally linked to a deal. ASK THE USER which apps the project uses — call list_apps for the valid vocabulary.',
     {
       name: z.string().min(1).max(300),
+      deal_id: askOrSkip(z.string().uuid(), 'the project has no deal').describe(
+        'REQUIRED — ask the user which deal this project belongs to, then use find_deal. Pass "skip" for an internal or pre-deal project.',
+      ),
+      contact_id: askOrSkip(z.string().uuid(), 'no client is linked').describe(
+        'REQUIRED — ask the user who the client is, then use search_contacts. Pass "skip" for none. Ignored when deal_id is given: the client is trigger-cached from the deal.',
+      ),
+      status: askOrSkip(z.string(), 'defaults to "upcoming"').describe(
+        'REQUIRED — ask the user. Real values from get_statuses("project"): upcoming, in_progress, client_pending, on_hold, payment_pending, handover, client_review, completed, internal, lost. Pass "skip" to default to "upcoming".',
+      ),
+      estimated_hours: askOrSkip(z.number(), 'no estimate is recorded').describe(
+        'REQUIRED — ask the user for the estimated hours. Pass "skip" for none.',
+      ),
+      start_date: askOrSkip(z.string(), 'no start date is set').describe(
+        'REQUIRED — ask the user for the start date (YYYY-MM-DD). Pass "skip" for none.',
+      ),
+      estimated_completion_date: askOrSkip(z.string(), 'no completion date is set').describe(
+        'REQUIRED — ask the user for the estimated completion date (YYYY-MM-DD). Pass "skip" for none.',
+      ),
+      project_manager_id: z.string().uuid().optional().describe('Use find_user.'),
       apps: z
         .array(z.string())
-        .describe(
-          'REQUIRED. Apps/tools this project uses, from the list_apps catalog (e.g. ["Monday.com","n8n"]). ASK THE USER if they have not said. Pass [] only if they confirm none apply.',
-        ),
-      deal_id: z.string().uuid().optional().describe('Omit for internal projects.'),
-      status: z.string().optional().describe('project_status; defaults to "upcoming". See get_statuses.'),
-      start_date: z.string().optional().describe('YYYY-MM-DD'),
-      estimated_completion_date: z.string().optional().describe('YYYY-MM-DD'),
-      estimated_hours: z.number().optional(),
-      project_manager_id: z.string().uuid().optional().describe('Use find_user.'),
+        .optional()
+        .describe('Apps/tools this project uses, from the list_apps catalog. Optional.'),
     },
     guard(async (a: any) => {
       // Normalise the app names to the catalog's canonical casing. Unlike the OS
       // UI, which silently drops unknown entries, we REJECT them and list what is
       // valid — a silent drop would lose data the caller thought it had set.
       const apps = await normaliseApps(env, Array.isArray(a.apps) ? a.apps : []);
+      const dealId = val<string>(a.deal_id);
+      const contactId = val<string>(a.contact_id);
 
       const rows = await asUser(env, (sql) => sql`
         INSERT INTO projects (
-          name, deal_id, status, start_date,
+          name, deal_id, contact_id, status, start_date,
           estimated_completion_date, estimated_hours, project_manager_id, apps_used
         )
         VALUES (
           ${a.name},
-          ${a.deal_id ?? null},
-          COALESCE(${a.status ?? null}::project_status, 'upcoming'::project_status),
-          ${a.start_date ?? null}::date,
-          ${a.estimated_completion_date ?? null}::date,
-          ${a.estimated_hours ?? null},
+          ${dealId},
+          -- Only meaningful for a deal-less project; with a deal the spine
+          -- trigger re-caches contact_id from it and overwrites this.
+          ${dealId ? null : contactId}::uuid,
+          COALESCE(${val<string>(a.status)}::project_status, 'upcoming'::project_status),
+          ${val<string>(a.start_date)}::date,
+          ${val<string>(a.estimated_completion_date)}::date,
+          ${val<number>(a.estimated_hours)},
           ${a.project_manager_id ?? null},
           ${apps}::text[]
         )
@@ -327,36 +594,49 @@ export function registerTools(server: ToolServer, env: Env): void {
       title: z.string().min(1).max(300),
       parent_id: z.string().uuid().describe('Usually a milestone id — see find_milestone.'),
       parent_type: z.enum(['milestone', 'deal', 'payment']).default('milestone'),
-      priority: PRIORITY.describe('REQUIRED. If the user has not said, ASK THEM — do not default to medium.'),
-      manager_ids: z
-        .array(z.string().uuid())
-        .min(1)
-        .describe(
-          'REQUIRED. The project manager(s) overseeing this task. If the user has not named one, ASK THEM, then use find_user. The first id also becomes the cached primary PM.',
-        ),
-      assignee_ids: z
-        .array(z.string().uuid())
-        .min(1)
-        .describe(
-          'REQUIRED. Who will do the work. If the user has not named anyone, ASK THEM, then use find_user.',
-        ),
-      start_date: z
-        .string()
-        .describe('REQUIRED. YYYY-MM-DD. If the user has not given a start date, ASK THEM.'),
-      plan_due_date: z
-        .string()
-        .describe('REQUIRED. YYYY-MM-DD. If the user has not given a due date, ASK THEM.'),
-      estimated_hours: z
-        .number()
-        .min(0)
-        .max(100000)
-        .describe('REQUIRED. Estimated effort in hours. If the user has not given one, ASK THEM.'),
-      status: z.string().optional().describe('task_status; defaults to "todo". See get_statuses.'),
+      manager_ids: askOrSkip(
+        z.array(z.string().uuid()).min(1),
+        'no manager is recorded',
+      ).describe(
+        'REQUIRED — ask the user which project manager oversees this task, then use find_user. Pass "skip" for none. The first id also becomes the cached primary PM.',
+      ),
+      // status and priority are DIFFERENT fields. "High priority" is
+      // priority=high — it is never a task_status value.
+      status: askOrSkip(z.string(), 'defaults to "todo"').describe(
+        'REQUIRED — ask the user. Real values from get_statuses("task"): todo, in_progress, client_review, client_pending, internal_action, qa_review, stuck, on_hold, done, … Pass "skip" to default to "todo". NOTE: "priority" is NOT a status — use the priority field.',
+      ),
+      priority: askOrSkip(PRIORITY, 'defaults to "medium"').describe(
+        'REQUIRED — ask the user: low, medium or high. A separate field from status. Pass "skip" to default to "medium".',
+      ),
+      plan_due_date: askOrSkip(z.string(), 'no due date is set').describe(
+        'REQUIRED — ask the user for the due date (YYYY-MM-DD). Pass "skip" for none.',
+      ),
+      estimated_hours: askOrSkip(z.number().min(0).max(100000), 'no estimate is recorded').describe(
+        'REQUIRED — ask the user for the estimated hours. Pass "skip" for none.',
+      ),
+      requirement: askOrSkip(z.string().max(20000), 'the requirement box is left empty').describe(
+        'REQUIRED — what actually needs doing, for the requirement box. If the user did not give it in the prompt, ASK THEM. Pass "skip" to leave it empty.',
+      ),
+      assignee_ids: askOrSkip(
+        z.array(z.string().uuid()),
+        'the task is created unassigned',
+      ).describe(
+        'REQUIRED — ask the user who will do the work, then use find_user. Pass "skip" to leave it unassigned.',
+      ),
+      start_date: askOrSkip(z.string(), 'no start date is set').describe(
+        'REQUIRED — ask the user for the start date (YYYY-MM-DD). Pass "skip" for none.',
+      ),
     },
     guard(async (a: any) => {
       const taskId = crypto.randomUUID();
-      const managerIds: string[] = a.manager_ids ?? [];
-      const assigneeIds: string[] = a.assignee_ids ?? [];
+      const managerIds = arrVal(a.manager_ids);
+      const assigneeIds = arrVal(a.assignee_ids);
+      const status = val<string>(a.status);
+      const priority = val<string>(a.priority);
+      const startDate = val<string>(a.start_date);
+      const dueDate = val<string>(a.plan_due_date);
+      const estHours = val<number>(a.estimated_hours);
+      const requirement = val<string>(a.requirement);
 
       // Insert WITHOUT RETURNING, then SELECT back in the same transaction: the
       // tasks SELECT policy (fn_can_see) is self-referential, so the new row is
@@ -365,18 +645,19 @@ export function registerTools(server: ToolServer, env: Env): void {
         sql`
           INSERT INTO tasks (
             id, title, parent_type, parent_id, status, priority, start_date, plan_due_date,
-            estimated_hours, primary_pm_id, is_management, created_by
+            estimated_hours, requirement, primary_pm_id, is_management, created_by
           )
           VALUES (
             ${taskId}::uuid,
             ${a.title},
             ${a.parent_type ?? 'milestone'}::entity_type,
             ${a.parent_id}::uuid,
-            COALESCE(${a.status ?? null}::task_status, 'todo'::task_status),
-            COALESCE(${a.priority ?? null}::priority, 'medium'::priority),
-            ${a.start_date ?? null}::date,
-            ${a.plan_due_date ?? null}::date,
-            ${a.estimated_hours ?? null},
+            COALESCE(${status}::task_status, 'todo'::task_status),
+            COALESCE(${priority}::priority, 'medium'::priority),
+            ${startDate}::date,
+            ${dueDate}::date,
+            ${estHours},
+            ${requirement},
             ${managerIds[0] ?? null}::uuid,
             false,
             ${actorUid(env)}::uuid
@@ -417,12 +698,14 @@ export function registerTools(server: ToolServer, env: Env): void {
     {
       name: z.string().min(1).max(300),
       project_id: z.string().uuid().describe('Required. Use find_project.'),
-      status: MILESTONE_STATUS.describe(
-        'REQUIRED. If the user has not said what state this milestone is in, ASK THEM — do not default to not_started.',
+      status: askOrSkip(MILESTONE_STATUS, 'defaults to "not_started"').describe(
+        'REQUIRED — ask the user: not_started, in_progress, in_review, client_pending, on_hold or done. Pass "skip" to default to "not_started".',
       ),
-      target_date: z.string().optional().describe('YYYY-MM-DD'),
-      estimated_hours: z.number().optional(),
-      price: z.number().optional(),
+      estimated_hours: askOrSkip(z.number(), 'no estimate is recorded').describe(
+        'REQUIRED — ask the user for the estimated hours. Pass "skip" for none.',
+      ),
+      target_date: z.string().optional().describe('YYYY-MM-DD. Optional.'),
+      price: z.number().optional().describe('Milestones are billable line items. Optional.'),
       currency: z.string().max(3).optional(),
     },
     guard(async (a: any) => {
@@ -439,9 +722,9 @@ export function registerTools(server: ToolServer, env: Env): void {
             ${milestoneId}::uuid,
             ${a.name},
             ${a.project_id}::uuid,
-            COALESCE(${a.status ?? null}::milestone_status, 'not_started'::milestone_status),
+            COALESCE(${val<string>(a.status)}::milestone_status, 'not_started'::milestone_status),
             ${a.target_date ?? null}::date,
-            ${a.estimated_hours ?? null},
+            ${val<number>(a.estimated_hours)},
             ${a.price ?? null},
             ${a.currency ?? null}
           )
@@ -466,7 +749,7 @@ export function registerTools(server: ToolServer, env: Env): void {
     'get_statuses',
     'List the allowed status values for an entity. Deals use pipeline stages (rows); everything else uses a Postgres enum.',
     {
-      entity: z.enum(['contact', 'deal', 'project', 'milestone', 'task', 'payment']),
+      entity: z.enum(['company', 'contact', 'deal', 'project', 'milestone', 'task', 'payment']),
     },
     guard(async (a: any) => {
       if (a.entity === 'deal') {
@@ -1288,13 +1571,21 @@ export function registerTools(server: ToolServer, env: Env): void {
     'get_record',
     'Fetch one record in full by id.',
     {
-      entity: z.enum(['contact', 'deal', 'project', 'milestone', 'task', 'payment']),
+      entity: z.enum(['company', 'contact', 'deal', 'project', 'milestone', 'task', 'payment']),
       id: z.string().uuid(),
     },
     guard(async (a: any) => {
       const id = a.id;
       let rows: Record<string, unknown>[];
       switch (a.entity) {
+        case 'company':
+          rows = await asUser(env, (sql) => sql`
+            SELECT c.*, u.full_name AS account_owner_name,
+                   (SELECT count(*)::int FROM contacts ct
+                     WHERE ct.company_id = c.id AND ct.archived_at IS NULL) AS contact_count
+            FROM companies c LEFT JOIN users u ON u.id = c.account_owner_id
+            WHERE c.id = ${id}::uuid`);
+          break;
         case 'contact':
           rows = await asUser(env, (sql) => sql`
             SELECT c.*, co.name AS company_name
@@ -1371,7 +1662,7 @@ export function registerTools(server: ToolServer, env: Env): void {
     'archive_record',
     'Archive ("delete") a record. Nothing is ever hard-deleted; this sets archived_at and records the reason in the audit log. Archive children before parents.',
     {
-      entity: z.enum(['contact', 'deal', 'project', 'milestone', 'task', 'payment']),
+      entity: z.enum(['company', 'contact', 'deal', 'project', 'milestone', 'task', 'payment']),
       id: z.string().uuid(),
       reason: z.string().trim().min(3).max(1000).describe('Required, 3-1000 chars. Goes on the audit row.'),
     },
@@ -1380,6 +1671,12 @@ export function registerTools(server: ToolServer, env: Env): void {
       const why = String(a.reason).trim();
       let rows: Record<string, unknown>[];
       switch (a.entity) {
+        case 'company':
+          rows = await asUserWithReason(env, why, (sql) => sql`
+            UPDATE companies SET archived_at = now(), updated_at = now()
+            WHERE id = ${id}::uuid AND archived_at IS NULL
+            RETURNING id, display_id, archived_at`);
+          break;
         case 'contact':
           rows = await asUserWithReason(env, why, (sql) => sql`
             UPDATE contacts SET archived_at = now(), updated_at = now()
@@ -1531,6 +1828,164 @@ export function registerTools(server: ToolServer, env: Env): void {
       ]);
       if (rows.length === 0) throw new Error('Update not permitted or contact not found.');
       return rows[0];
+    }),
+  );
+
+  // =========================================================================
+  // ATTACHMENTS — polymorphic (parent_type, parent_id), one table for every
+  // entity. RLS gates the insert on fn_can_edit of the PARENT record.
+  // =========================================================================
+  server.tool(
+    'add_attachment',
+    'Attach a file or link to any record. For a file, pass file_base64 and the MCP stores the contents; for a link, just pass the url.',
+    {
+      parent_type: z.enum(['company', 'contact', 'deal', 'project', 'milestone', 'task', 'payment']),
+      parent_id: z.string().uuid(),
+      title: z.string().min(1).max(300).describe('Display name, e.g. "Signed contract.pdf".'),
+      url: z
+        .string()
+        .max(2000)
+        .optional()
+        .describe('Required for a link. For an uploaded file this is a label such as the filename.'),
+      file_base64: z
+        .string()
+        .optional()
+        .describe('Base64 file contents. Supplying this makes it kind="file" and stores the bytes.'),
+      mime_type: z.string().max(200).optional(),
+      purpose: z
+        .string()
+        .max(200)
+        .optional()
+        .describe('Free-text tag, e.g. requirement, signed_contract, proof_of_payment.'),
+    },
+    guard(async (a: any) => {
+      const isFile = typeof a.file_base64 === 'string' && a.file_base64.length > 0;
+      if (!isFile && !a.url) {
+        throw new Error('Pass url for a link, or file_base64 for a file.');
+      }
+      const attachmentId = crypto.randomUUID();
+      const sizeBytes = isFile ? Math.floor((a.file_base64.length * 3) / 4) : null;
+
+      // TWO statements, one transaction: the attachment_blobs INSERT policy does
+      // `EXISTS (SELECT 1 FROM attachments …)`, which cannot see a row inserted
+      // by the SAME statement. Splitting them makes the parent visible to the
+      // blob's policy check while keeping both atomic.
+      const queries = (sql: any) => {
+        const out = [
+          sql`
+            INSERT INTO attachments (
+              id, parent_type, parent_id, kind, title, url,
+              mime_type, size_bytes, purpose, uploaded_by
+            )
+            VALUES (
+              ${attachmentId}::uuid,
+              ${a.parent_type}::entity_type,
+              ${a.parent_id}::uuid,
+              ${isFile ? 'file' : 'link'}::attachment_kind,
+              ${a.title},
+              ${a.url ?? a.title},
+              ${a.mime_type ?? null},
+              ${sizeBytes},
+              ${a.purpose ?? null},
+              ${actorUid(env)}::uuid
+            )
+          `,
+        ];
+        if (isFile) {
+          out.push(sql`
+            INSERT INTO attachment_blobs (attachment_id, data_base64)
+            VALUES (${attachmentId}::uuid, ${a.file_base64})
+          `);
+        }
+        out.push(sql`SELECT id FROM attachments WHERE id = ${attachmentId}::uuid`);
+        return out;
+      };
+
+      const rows = await asUserMany(env, queries);
+      if (rows.length === 0) {
+        throw new Error('Not permitted to attach to that record, or the record does not exist.');
+      }
+      return {
+        id: attachmentId,
+        parent_type: a.parent_type,
+        parent_id: a.parent_id,
+        kind: isFile ? 'file' : 'link',
+        title: a.title,
+        size_bytes: sizeBytes,
+      };
+    }),
+  );
+
+  server.tool(
+    'list_attachments',
+    'List the files and links attached to a record.',
+    {
+      parent_type: z.enum(['company', 'contact', 'deal', 'project', 'milestone', 'task', 'payment']),
+      parent_id: z.string().uuid(),
+    },
+    guard(async (a: any) =>
+      // Deliberately does NOT return data_base64 — file contents are fetched
+      // one at a time in the app, never dumped into a list response.
+      asUser(env, (sql) => sql`
+        SELECT at.id, at.kind::text AS kind, at.title, at.url, at.mime_type,
+               at.size_bytes, at.purpose, at.created_at,
+               u.full_name AS uploaded_by_name
+        FROM attachments at
+        LEFT JOIN users u ON u.id = at.uploaded_by
+        WHERE at.parent_type = ${a.parent_type}::entity_type
+          AND at.parent_id = ${a.parent_id}::uuid
+          AND at.archived_at IS NULL
+        ORDER BY at.created_at DESC
+      `),
+    ),
+  );
+
+  // =========================================================================
+  // CREDENTIALS — METADATA ONLY.
+  //
+  // 🚨 There is deliberately NO tool that returns a credential secret.
+  // `credentials.secret_ref` is encrypted at rest and the column is REVOKED
+  // from every app role (migration 0005: REVOKE SELECT (secret_ref) … FROM
+  // PUBLIC). Plaintext is readable only through the OS's reveal_credential
+  // action, which runs as a service role and writes to credential_access_log
+  // BEFORE decrypting. Exposing that here would need the service role — which
+  // is exactly the escalation the design prevents — and would put client
+  // passwords into chat transcripts. Metadata answers the real question
+  // ("do we have access to their Shopify?") without ever holding a secret.
+  // =========================================================================
+  server.tool(
+    'get_credentials',
+    'List credential RECORDS for a client or project — label, login URL, username, whether we have access. Never returns passwords; reveal those in the OS app.',
+    {
+      parent_type: z.enum(['contact', 'project', 'milestone']),
+      parent_id: z.string().uuid(),
+    },
+    guard(async (a: any) => {
+      const rows = await asUser(env, (sql) => sql`
+        SELECT c.id, c.label, c.login_url, c.username,
+               c.two_factor_enabled, c.two_factor_destination,
+               c.we_have_account_access, c.our_access_account,
+               c.client_credentials_available, c.notes, c.created_at,
+               ct.full_name AS contact_name, ct.display_id AS contact_display_id
+        FROM credentials c
+        LEFT JOIN contacts ct ON ct.id = c.contact_id
+        WHERE c.archived_at IS NULL
+          AND (
+            (${a.parent_type}::text = 'contact' AND c.contact_id = ${a.parent_id}::uuid)
+            OR EXISTS (
+              SELECT 1 FROM credential_links cl
+              WHERE cl.credential_id = c.id
+                AND cl.parent_type = ${a.parent_type}::entity_type
+                AND cl.parent_id = ${a.parent_id}::uuid
+            )
+          )
+        ORDER BY c.label
+      `);
+      return {
+        count: rows.length,
+        note: 'Secrets are not available through this MCP by design. Reveal them in the GrowwStacks OS app, where the access is logged.',
+        credentials: rows,
+      };
     }),
   );
 
