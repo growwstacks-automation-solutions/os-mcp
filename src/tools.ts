@@ -117,6 +117,56 @@ function arrVal(v: string[] | typeof SKIP | undefined): string[] {
   return v === undefined || v === SKIP ? [] : v;
 }
 
+/**
+ * coerceArray — rescue an array argument that arrived as a STRING.
+ *
+ * Several MCP clients serialise array arguments as JSON text ("[\"uuid\"]"), or
+ * send a single bare value, instead of a real JSON array. Zod then rejects it,
+ * and for an ask-or-skip union the failure reads "expected array, received
+ * string" AND "expected 'skip'" at once — the misleading dual error that made
+ * create_task's assignee_ids / manager_ids unusable from a connector.
+ *
+ * This only WIDENS what parses. A real array is returned untouched and the
+ * "skip" sentinel is passed straight through so the union's literal branch
+ * still matches, so no input that works today behaves differently; inputs that
+ * previously errored now succeed.
+ */
+function coerceArray(v: unknown): unknown {
+  if (Array.isArray(v) || typeof v !== 'string') return v;
+  const s = v.trim();
+  // Empty and the sentinel are left alone for the union branches to handle.
+  if (s === '' || s === SKIP) return v;
+  if (s.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(s);
+      if (Array.isArray(parsed)) return parsed;
+    } catch {
+      // Malformed JSON — fall through and treat it as a delimited list.
+    }
+  }
+  return s
+    .split(',')
+    .map((part) => part.trim().replace(/^["'[\s]+|["'\]\s]+$/g, '').trim())
+    .filter((part) => part.length > 0);
+}
+
+/**
+ * askOrSkipArray — askOrSkip for an ARRAY field. Identical contract and identical
+ * advertised JSON Schema; it just tolerates a stringified array on the way in.
+ */
+function askOrSkipArray<T extends z.ZodTypeAny>(inner: T, ifSkipped: string) {
+  return z
+    .preprocess(coerceArray, z.union([inner, z.literal(SKIP)]))
+    .describe(
+      `REQUIRED — ask the user. If they don't want to give one, pass "skip" (${ifSkipped}). Never invent a value. A JSON array is expected; a single id or a comma-separated list is also accepted.`,
+    );
+}
+
+/** An OPTIONAL array field, equally tolerant of stringified input. */
+function optArray<T extends z.ZodTypeAny>(inner: T) {
+  return z.preprocess(coerceArray, inner.optional());
+}
+
 // company_type (migration 0001). These are the business-facing words the team
 // already uses — "Client" and "Past Client" ARE the enum values here. Note this
 // is a DIFFERENT vocabulary from contact_status (prospect/active_client/…),
@@ -594,7 +644,7 @@ export function registerTools(server: ToolServer, env: Env): void {
       title: z.string().min(1).max(300),
       parent_id: z.string().uuid().describe('Usually a milestone id — see find_milestone.'),
       parent_type: z.enum(['milestone', 'deal', 'payment']).default('milestone'),
-      manager_ids: askOrSkip(
+      manager_ids: askOrSkipArray(
         z.array(z.string().uuid()).min(1),
         'no manager is recorded',
       ).describe(
@@ -617,7 +667,7 @@ export function registerTools(server: ToolServer, env: Env): void {
       requirement: askOrSkip(z.string().max(20000), 'the requirement box is left empty').describe(
         'REQUIRED — what actually needs doing, for the requirement box. If the user did not give it in the prompt, ASK THEM. Pass "skip" to leave it empty.',
       ),
-      assignee_ids: askOrSkip(
+      assignee_ids: askOrSkipArray(
         z.array(z.string().uuid()),
         'the task is created unassigned',
       ).describe(
@@ -626,6 +676,18 @@ export function registerTools(server: ToolServer, env: Env): void {
       start_date: askOrSkip(z.string(), 'no start date is set').describe(
         'REQUIRED — ask the user for the start date (YYYY-MM-DD). Pass "skip" for none.',
       ),
+      // Attribution only. The MCP authenticates with ONE shared token and acts
+      // under ONE identity (GS_ACTOR_UID), so the database cannot know which
+      // human is calling — it has to be told. This records that person on
+      // created_by WITHOUT touching app.current_user_id, so RLS still authorizes
+      // the call exactly as it does today. Omitted => the previous behaviour.
+      acting_user_id: z
+        .string()
+        .uuid()
+        .optional()
+        .describe(
+          'Optional. The real person creating this task — look them up with find_user. Recorded as created_by so the task is attributed to a human instead of the MCP service account. Omit to keep the system account. Does NOT change permissions.',
+        ),
     },
     guard(async (a: any) => {
       const taskId = crypto.randomUUID();
@@ -637,6 +699,9 @@ export function registerTools(server: ToolServer, env: Env): void {
       const dueDate = val<string>(a.plan_due_date);
       const estHours = val<number>(a.estimated_hours);
       const requirement = val<string>(a.requirement);
+      // Attribution: the named human when the caller supplied one, otherwise the
+      // service identity exactly as before.
+      const createdBy = a.acting_user_id ?? actorUid(env);
 
       // Insert WITHOUT RETURNING, then SELECT back in the same transaction: the
       // tasks SELECT policy (fn_can_see) is self-referential, so the new row is
@@ -660,7 +725,7 @@ export function registerTools(server: ToolServer, env: Env): void {
             ${requirement},
             ${managerIds[0] ?? null}::uuid,
             false,
-            ${actorUid(env)}::uuid
+            ${createdBy}::uuid
           )
         `,
         ...managerIds.map(
@@ -677,12 +742,30 @@ export function registerTools(server: ToolServer, env: Env): void {
             ON CONFLICT (task_id, user_id) DO NOTHING
           `,
         ),
-        sql`SELECT *,
-                   to_char(start_date, 'YYYY-MM-DD')           AS start_date,
-                   to_char(plan_due_date, 'YYYY-MM-DD')        AS plan_due_date,
-                   to_char(execution_start_date, 'YYYY-MM-DD') AS execution_start_date,
-                   to_char(execution_end_date, 'YYYY-MM-DD')   AS execution_end_date
-            FROM tasks WHERE id = ${taskId}::uuid`,
+        // Read the task back WITH its relations, so a create returns the same
+        // full field feed as get_record and the caller never has to follow up
+        // just to see who ended up attached.
+        sql`SELECT t.*,
+                   to_char(t.start_date, 'YYYY-MM-DD')           AS start_date,
+                   to_char(t.plan_due_date, 'YYYY-MM-DD')        AS plan_due_date,
+                   to_char(t.execution_start_date, 'YYYY-MM-DD') AS execution_start_date,
+                   to_char(t.execution_end_date, 'YYYY-MM-DD')   AS execution_end_date,
+                   cu.full_name AS created_by_name,
+                   pm.full_name AS primary_pm_name,
+                   COALESCE((
+                     SELECT jsonb_agg(jsonb_build_object('user_id', u.id, 'name', u.full_name))
+                     FROM task_assignees ta JOIN users u ON u.id = ta.user_id
+                     WHERE ta.task_id = t.id
+                   ), '[]'::jsonb) AS assignees,
+                   COALESCE((
+                     SELECT jsonb_agg(jsonb_build_object('user_id', u.id, 'name', u.full_name))
+                     FROM task_managers tm JOIN users u ON u.id = tm.user_id
+                     WHERE tm.task_id = t.id
+                   ), '[]'::jsonb) AS managers
+            FROM tasks t
+            LEFT JOIN users cu ON cu.id = t.created_by
+            LEFT JOIN users pm ON pm.id = t.primary_pm_id
+            WHERE t.id = ${taskId}::uuid`,
       ]);
       if (rows.length === 0) throw new Error('Create not permitted or invalid input.');
       return rows[0];
@@ -1510,16 +1593,28 @@ export function registerTools(server: ToolServer, env: Env): void {
     {
       assignee_id: z.string().uuid().optional().describe('Tasks assigned to this user.'),
       manager_id: z.string().uuid().optional().describe('Tasks this user manages.'),
+      created_by: z
+        .string()
+        .uuid()
+        .optional()
+        .describe('Tasks created by this user - use find_user. Matches the created_by column.'),
       project_id: z.string().uuid().optional(),
       milestone_id: z.string().uuid().optional(),
-      status: z.array(z.string()).optional(),
+      status: optArray(z.array(z.string())),
       due_before: z.string().optional().describe('plan_due_date <= YYYY-MM-DD'),
       search: z.string().max(200).optional().describe('Matches title or display id.'),
       include_management: z.boolean().default(false).describe('Include management-stream tasks.'),
+      full: z
+        .boolean()
+        .default(false)
+        .describe(
+          'Return the complete field feed per task (requirement, details, delivery state, execution dates, reported hours, loom url, spine ids and timestamps) instead of the summary columns. Off by default because requirement/details can be very large across many rows.',
+        ),
       limit: z.number().int().min(1).max(500).default(100),
     },
     guard(async (a: any) => {
       const statuses = a.status?.length ? a.status : null;
+      const full = a.full === true;
       const search = a.search ? `%${a.search}%` : null;
       return asUser(env, (sql) => sql`
         SELECT t.id, t.display_id, t.title,
@@ -1527,6 +1622,28 @@ export function registerTools(server: ToolServer, env: Env): void {
                t.start_date::text AS start_date,
                t.plan_due_date::text AS plan_due_date,
                t.estimated_hours, t.is_management,
+               -- Always present now: WHO created the task. The column existed
+               -- on the row all along; this tool simply never selected it.
+               t.created_by, cu.full_name AS created_by_name,
+               -- The remainder of the feed, only when full=true. A CASE keeps
+               -- this to ONE statement instead of branching the whole query.
+               CASE WHEN ${full}::boolean THEN t.requirement END AS requirement,
+               CASE WHEN ${full}::boolean THEN t.details END AS details,
+               CASE WHEN ${full}::boolean THEN t.delivery_state::text END AS delivery_state,
+               CASE WHEN ${full}::boolean THEN t.primary_pm_id END AS primary_pm_id,
+               CASE WHEN ${full}::boolean THEN pm.full_name END AS primary_pm_name,
+               CASE WHEN ${full}::boolean THEN t.execution_start_date::text END AS execution_start_date,
+               CASE WHEN ${full}::boolean THEN t.execution_end_date::text END AS execution_end_date,
+               CASE WHEN ${full}::boolean THEN t.time_reported_hours END AS time_reported_hours,
+               CASE WHEN ${full}::boolean THEN t.loom_url END AS loom_url,
+               CASE WHEN ${full}::boolean THEN t.ai_created END AS ai_created,
+               CASE WHEN ${full}::boolean THEN t.parent_type::text END AS parent_type,
+               CASE WHEN ${full}::boolean THEN t.parent_id END AS parent_id,
+               CASE WHEN ${full}::boolean THEN t.contact_id END AS contact_id,
+               CASE WHEN ${full}::boolean THEN t.company_id END AS company_id,
+               CASE WHEN ${full}::boolean THEN t.status_changed_at END AS status_changed_at,
+               CASE WHEN ${full}::boolean THEN t.created_at END AS created_at,
+               CASE WHEN ${full}::boolean THEN t.updated_at END AS updated_at,
                p.id AS project_id, p.name AS project_name,
                m.id AS milestone_id, m.name AS milestone_name,
                c.full_name AS client_name,
@@ -1544,6 +1661,8 @@ export function registerTools(server: ToolServer, env: Env): void {
         LEFT JOIN projects p   ON p.id = t.project_id
         LEFT JOIN milestones m ON m.id = t.milestone_id
         LEFT JOIN contacts c   ON c.id = t.contact_id
+        LEFT JOIN users cu     ON cu.id = t.created_by
+        LEFT JOIN users pm     ON pm.id = t.primary_pm_id
         WHERE t.archived_at IS NULL
           AND (${a.include_management === true}::boolean = true OR t.is_management = false)
           AND (${a.project_id ?? null}::uuid IS NULL OR t.project_id = ${a.project_id ?? null}::uuid)
@@ -1561,6 +1680,7 @@ export function registerTools(server: ToolServer, env: Env): void {
             OR EXISTS (SELECT 1 FROM task_managers tm
                        WHERE tm.task_id = t.id AND tm.user_id = ${a.manager_id ?? null}::uuid)
           )
+          AND (${a.created_by ?? null}::uuid IS NULL OR t.created_by = ${a.created_by ?? null}::uuid)
         ORDER BY t.plan_due_date NULLS LAST, t.created_at DESC
         LIMIT ${a.limit ?? 100}
       `);
@@ -1625,17 +1745,34 @@ export function registerTools(server: ToolServer, env: Env): void {
             WHERE m.id = ${id}::uuid`);
           break;
         case 'task':
+          // t.* already carried created_by; what was missing is the creator's
+          // NAME and the assignee/manager relations. A single task fetch is now
+          // the complete feed, with no follow-up calls needed.
           rows = await asUser(env, (sql) => sql`
             SELECT t.*,
                    to_char(t.start_date, 'YYYY-MM-DD')           AS start_date,
                    to_char(t.plan_due_date, 'YYYY-MM-DD')        AS plan_due_date,
                    to_char(t.execution_start_date, 'YYYY-MM-DD') AS execution_start_date,
                    to_char(t.execution_end_date, 'YYYY-MM-DD')   AS execution_end_date,
-                   p.name AS project_name, m.name AS milestone_name, c.full_name AS client_name
+                   p.name AS project_name, m.name AS milestone_name, c.full_name AS client_name,
+                   cu.full_name AS created_by_name,
+                   pm.full_name AS primary_pm_name,
+                   COALESCE((
+                     SELECT jsonb_agg(jsonb_build_object('user_id', u.id, 'name', u.full_name))
+                     FROM task_assignees ta JOIN users u ON u.id = ta.user_id
+                     WHERE ta.task_id = t.id
+                   ), '[]'::jsonb) AS assignees,
+                   COALESCE((
+                     SELECT jsonb_agg(jsonb_build_object('user_id', u.id, 'name', u.full_name))
+                     FROM task_managers tm JOIN users u ON u.id = tm.user_id
+                     WHERE tm.task_id = t.id
+                   ), '[]'::jsonb) AS managers
             FROM tasks t
             LEFT JOIN projects p   ON p.id = t.project_id
             LEFT JOIN milestones m ON m.id = t.milestone_id
             LEFT JOIN contacts c   ON c.id = t.contact_id
+            LEFT JOIN users cu     ON cu.id = t.created_by
+            LEFT JOIN users pm     ON pm.id = t.primary_pm_id
             WHERE t.id = ${id}::uuid`);
           break;
         default:
