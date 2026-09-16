@@ -120,6 +120,27 @@ const CREATOR_NOT_STATED = 'not_stated_by_user';
 
 const CREATOR_CHOICES = [...CREATOR_IDS, CREATOR_NOT_STATED] as [string, ...string[]];
 
+/** What creator_quote must say when the user named nobody. */
+const CREATOR_QUOTE_NONE = 'none';
+
+/** The question the server hands back whenever a creator cannot be established. */
+const CREATOR_QUESTION =
+  'ASK THE USER this question before trying again: "Who should I record as the creator of '
+  + `this task \u2014 ${Object.keys(TASK_CREATORS).join(' or ')}?" `
+  + 'Only those people may be recorded. When the user answers, call create_task again, '
+  + 'putting their answer in creator_quote. Do not choose on their behalf, and do not retry '
+  + 'with the same values.';
+
+/** The permitted creator whose first name appears in `text`, if any. */
+function creatorNamedIn(text: string): string | null {
+  const haystack = text.toLowerCase();
+  for (const name of Object.keys(TASK_CREATORS)) {
+    const first = name.split(' ')[0].toLowerCase();
+    if (haystack.includes(first) || haystack.includes(name.toLowerCase())) return name;
+  }
+  return null;
+}
+
 /** "Faizal Khan = <id>; Manish Mandot = <id>" - inlined into the description. */
 const CREATOR_HINT = Object.entries(TASK_CREATORS)
   .map(([name, id]) => `${name} = ${id}`)
@@ -735,6 +756,18 @@ export function registerTools(server: ToolServer, env: Env): void {
       acting_user_id: z.enum(CREATOR_CHOICES).describe(
         `REQUIRED — who is creating this task. The ONLY permitted creators are: ${CREATOR_HINT}. Pass one of those two ids if and ONLY IF the user named the creator in THIS request. In EVERY other case you MUST pass "${CREATOR_NOT_STATED}" — that includes when they said nothing about a creator, when they named anybody else, and when you would be taking it from an earlier message, another task, the assignee or the manager. Passing "${CREATOR_NOT_STATED}" returns an error containing the question to put to the user; that is the intended flow, not a failure. There is no default and no system-account fallback. Never guess who the creator is.`,
       ),
+      // EVIDENCE for acting_user_id. Saying "ask the user" in a description does not make a
+      // model ask - it fills the field and moves on, and a server cannot tell a stated name
+      // from an invented one when both arrive as the same id. Quoting can be checked: the
+      // server verifies this text actually contains the name that was selected, so the only
+      // way to record a creator the user never mentioned is to fabricate their words.
+      creator_quote: z
+        .string()
+        .min(1)
+        .max(500)
+        .describe(
+          `REQUIRED — copy, VERBATIM, the words from the user request that name the task creator (for example "created by Faizal Khan"). Pass "${CREATOR_QUOTE_NONE}" if the user did not name a creator anywhere in their request. Never paraphrase, never invent, and never quote from an earlier message or another task. The server checks that this text contains the name chosen in acting_user_id and refuses the call if it does not.`,
+        ),
     },
     guard(async (a: any) => {
       const taskId = crypto.randomUUID();
@@ -748,19 +781,35 @@ export function registerTools(server: ToolServer, env: Env): void {
       const requirement = val<string>(a.requirement);
       // Attribution: the named human when the caller supplied one, otherwise the
       // service identity exactly as before.
-      // The model told us the user never named a creator. Refuse, and hand back the
-      // exact question to ask. Nothing is written, so there is no half-made task and
-      // no wrong attribution - the caller simply asks and calls again.
-      if (a.acting_user_id === CREATOR_NOT_STATED) {
+      // ------------------------------------------------------------------
+      // CREATOR: the id must be backed by the user's own words.
+      // Nothing is written on any failure path below, so a refusal never
+      // leaves a half-made task or a wrongly attributed one.
+      // ------------------------------------------------------------------
+      const quote = String(a.creator_quote ?? '').trim();
+      const quotedNobody = quote.toLowerCase() === CREATOR_QUOTE_NONE;
+
+      // The model has told us outright that the user named no creator.
+      if (a.acting_user_id === CREATOR_NOT_STATED || quotedNobody) {
+        throw new Error(`The creator of this task has not been specified. ${CREATOR_QUESTION}`);
+      }
+
+      const chosenName = Object.keys(TASK_CREATORS).find(
+        (name) => TASK_CREATORS[name] === a.acting_user_id,
+      );
+
+      // The quoted words must actually name the person selected. This is the check
+      // that catches an inferred creator: in a request that never mentions them,
+      // no honest quote can contain their name.
+      if (!chosenName || creatorNamedIn(quote) !== chosenName) {
         throw new Error(
-          'The creator of this task has not been specified. ASK THE USER this question '
-          + 'before trying again: "Who should I record as the creator of this task — '
-          + `${Object.keys(TASK_CREATORS).join(' or ')}?" Only those people may be `
-          + 'recorded as the creator. When the user answers, call create_task again with '
-          + 'that person\'s id. Do not choose on their behalf and do not retry with the '
-          + 'same value.',
+          `The creator you selected (${chosenName ?? 'unknown'}) does not appear in the text `
+          + `you quoted from the user: "${quote}". A creator must be taken from what the user `
+          + `actually wrote, never inferred from the assignee, the manager, an earlier `
+          + `message or another task. ${CREATOR_QUESTION}`,
         );
       }
+
       const createdBy = a.acting_user_id;
 
       // Insert WITHOUT RETURNING, then SELECT back in the same transaction: the
