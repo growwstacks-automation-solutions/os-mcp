@@ -105,6 +105,21 @@ const TASK_CREATORS: Record<string, string> = {
 
 const CREATOR_IDS = Object.values(TASK_CREATORS) as [string, ...string[]];
 
+/**
+ * The "the user did not tell me" sentinel.
+ *
+ * A description cannot make a model stop and ask a question - four deployed
+ * attempts confirmed that; it just fills the field with whatever name is nearest.
+ * What a model DOES do reliably is report a fact when asked one directly, and
+ * relay a tool error back to the user. So the field asks a factual question -
+ * did the user name a creator in THIS request? - and the server refuses this
+ * value with the exact question to put to them. There is no path to a successful
+ * create that does not name a real person.
+ */
+const CREATOR_NOT_STATED = 'not_stated_by_user';
+
+const CREATOR_CHOICES = [...CREATOR_IDS, CREATOR_NOT_STATED] as [string, ...string[]];
+
 /** "Faizal Khan = <id>; Manish Mandot = <id>" - inlined into the description. */
 const CREATOR_HINT = Object.entries(TASK_CREATORS)
   .map(([name, id]) => `${name} = ${id}`)
@@ -713,13 +728,12 @@ export function registerTools(server: ToolServer, env: Env): void {
       //
       // Attribution ONLY: this sets created_by and never touches
       // app.current_user_id, so RLS authorizes the call exactly as before.
-      // NO ask-or-skip here, deliberately. With a "skip" option the model took it
-      // whenever it was unsure, and every such task landed on MCP (System) again -
-      // the exact problem this field exists to fix. A closed two-value enum with no
-      // escape means created_by is ALWAYS a real person, and the model has to ask
-      // rather than quietly fall back.
-      acting_user_id: z.enum(CREATOR_IDS).describe(
-        `REQUIRED — who is creating this task. ONLY these two people are permitted: ${CREATOR_HINT}. There is NO skip and NO default. If the user has not said which of the two they are in THIS request, ASK THEM before calling this tool; if they named anyone else, tell them only these two are permitted and ask which to record. Do NOT infer it from earlier messages, from another task, from the assignee or from the manager, and do NOT call find_user for this field — the two ids above are the only accepted values.`,
+      // Three values: the two permitted people, plus an explicit "the user did not
+      // say" sentinel that the SERVER rejects with the question to ask. The sentinel
+      // is NOT an escape hatch like the old "skip" - it cannot produce a task. It
+      // exists so the model has an honest answer available other than guessing.
+      acting_user_id: z.enum(CREATOR_CHOICES).describe(
+        `REQUIRED — who is creating this task. The ONLY permitted creators are: ${CREATOR_HINT}. Pass one of those two ids if and ONLY IF the user named the creator in THIS request. In EVERY other case you MUST pass "${CREATOR_NOT_STATED}" — that includes when they said nothing about a creator, when they named anybody else, and when you would be taking it from an earlier message, another task, the assignee or the manager. Passing "${CREATOR_NOT_STATED}" returns an error containing the question to put to the user; that is the intended flow, not a failure. There is no default and no system-account fallback. Never guess who the creator is.`,
       ),
     },
     guard(async (a: any) => {
@@ -734,8 +748,20 @@ export function registerTools(server: ToolServer, env: Env): void {
       const requirement = val<string>(a.requirement);
       // Attribution: the named human when the caller supplied one, otherwise the
       // service identity exactly as before.
-      // Always supplied now (required enum, no skip); the fallback is belt-and-braces.
-      const createdBy = a.acting_user_id ?? actorUid(env);
+      // The model told us the user never named a creator. Refuse, and hand back the
+      // exact question to ask. Nothing is written, so there is no half-made task and
+      // no wrong attribution - the caller simply asks and calls again.
+      if (a.acting_user_id === CREATOR_NOT_STATED) {
+        throw new Error(
+          'The creator of this task has not been specified. ASK THE USER this question '
+          + 'before trying again: "Who should I record as the creator of this task — '
+          + `${Object.keys(TASK_CREATORS).join(' or ')}?" Only those people may be `
+          + 'recorded as the creator. When the user answers, call create_task again with '
+          + 'that person\'s id. Do not choose on their behalf and do not retry with the '
+          + 'same value.',
+        );
+      }
+      const createdBy = a.acting_user_id;
 
       // Insert WITHOUT RETURNING, then SELECT back in the same transaction: the
       // tasks SELECT policy (fn_can_see) is self-referential, so the new row is
