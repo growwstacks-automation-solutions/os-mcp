@@ -639,7 +639,7 @@ export function registerTools(server: ToolServer, env: Env): void {
   // =========================================================================
   server.tool(
     'create_task',
-    'Create a task under a milestone (or a deal/payment). ASK THE USER for priority, project manager, assignee, start date, due date and estimated hours if any are missing — never guess them.',
+    'Create a task under a milestone (or a deal/payment). ASK THE USER for priority, project manager, assignee, start date, due date, estimated hours AND who is creating the task if any are missing — never guess them.',
     {
       title: z.string().min(1).max(300),
       parent_id: z.string().uuid().describe('Usually a milestone id — see find_milestone.'),
@@ -678,16 +678,21 @@ export function registerTools(server: ToolServer, env: Env): void {
       ),
       // Attribution only. The MCP authenticates with ONE shared token and acts
       // under ONE identity (GS_ACTOR_UID), so the database cannot know which
-      // human is calling — it has to be told. This records that person on
-      // created_by WITHOUT touching app.current_user_id, so RLS still authorizes
-      // the call exactly as it does today. Omitted => the previous behaviour.
-      acting_user_id: z
-        .string()
-        .uuid()
-        .optional()
-        .describe(
-          'Optional. The real person creating this task — look them up with find_user. Recorded as created_by so the task is attributed to a human instead of the MCP service account. Omit to keep the system account. Does NOT change permissions.',
-        ),
+      // human is calling — it has to be told.
+      //
+      // ask-or-skip, NOT optional: an optional field lets the model quietly omit
+      // it, which is the silent defaulting this file exists to prevent. Every task
+      // was landing on the MCP service account because nobody was ever asked.
+      // Required-but-skippable forces a conscious choice on every create.
+      //
+      // Attribution ONLY: this sets created_by and never touches
+      // app.current_user_id, so RLS authorizes the call exactly as before.
+      acting_user_id: askOrSkip(
+        z.string().uuid(),
+        'the MCP system account is recorded as the creator instead of a person',
+      ).describe(
+        'REQUIRED — ASK THE USER who is creating this task ("who should I record as the creator?"), then resolve that name with find_user and pass their id. Pass "skip" to record the MCP system account. Never guess, and never assume it is the assignee or the manager.',
+      ),
     },
     guard(async (a: any) => {
       const taskId = crypto.randomUUID();
@@ -701,7 +706,7 @@ export function registerTools(server: ToolServer, env: Env): void {
       const requirement = val<string>(a.requirement);
       // Attribution: the named human when the caller supplied one, otherwise the
       // service identity exactly as before.
-      const createdBy = a.acting_user_id ?? actorUid(env);
+      const createdBy = val<string>(a.acting_user_id) ?? actorUid(env);
 
       // Insert WITHOUT RETURNING, then SELECT back in the same transaction: the
       // tasks SELECT policy (fn_can_see) is self-referential, so the new row is
