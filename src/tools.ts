@@ -713,11 +713,13 @@ export function registerTools(server: ToolServer, env: Env): void {
       //
       // Attribution ONLY: this sets created_by and never touches
       // app.current_user_id, so RLS authorizes the call exactly as before.
-      acting_user_id: askOrSkip(
-        z.enum(CREATOR_IDS),
-        'the MCP system account is recorded as the creator instead of a person',
-      ).describe(
-        `REQUIRED — who is creating this task. ONLY these two people are permitted: ${CREATOR_HINT}. ASK THE USER which of the two they are unless they have said so in THIS request. Do NOT infer it from earlier messages, from another task, from the assignee or from the manager, and do NOT call find_user for this field — the two ids above are the only accepted values. Pass "skip" to record the MCP system account instead.`,
+      // NO ask-or-skip here, deliberately. With a "skip" option the model took it
+      // whenever it was unsure, and every such task landed on MCP (System) again -
+      // the exact problem this field exists to fix. A closed two-value enum with no
+      // escape means created_by is ALWAYS a real person, and the model has to ask
+      // rather than quietly fall back.
+      acting_user_id: z.enum(CREATOR_IDS).describe(
+        `REQUIRED — who is creating this task. ONLY these two people are permitted: ${CREATOR_HINT}. There is NO skip and NO default. If the user has not said which of the two they are in THIS request, ASK THEM before calling this tool; if they named anyone else, tell them only these two are permitted and ask which to record. Do NOT infer it from earlier messages, from another task, from the assignee or from the manager, and do NOT call find_user for this field — the two ids above are the only accepted values.`,
       ),
     },
     guard(async (a: any) => {
@@ -732,7 +734,8 @@ export function registerTools(server: ToolServer, env: Env): void {
       const requirement = val<string>(a.requirement);
       // Attribution: the named human when the caller supplied one, otherwise the
       // service identity exactly as before.
-      const createdBy = val<string>(a.acting_user_id) ?? actorUid(env);
+      // Always supplied now (required enum, no skip); the fallback is belt-and-braces.
+      const createdBy = a.acting_user_id ?? actorUid(env);
 
       // Insert WITHOUT RETURNING, then SELECT back in the same transaction: the
       // tasks SELECT policy (fn_can_see) is self-referential, so the new row is
