@@ -131,6 +131,23 @@ const CREATOR_QUESTION =
   + 'putting their answer in creator_quote. Do not choose on their behalf, and do not retry '
   + 'with the same values.';
 
+/**
+ * Remove the phrases that name an ASSIGNEE or a MANAGER.
+ *
+ * Checking only that the quoted text contains the name is not enough: on a task
+ * whose assignee or manager happens to be a permitted creator, "assigned to
+ * Faizal Khan" would satisfy a creator check and silently mis-attribute the row.
+ * Each phrase is cut at the next comma, full stop or semicolon, so a mixed
+ * sentence such as "assigned to Faizal Khan, created by Manish Mandot" keeps the
+ * creator clause and loses only the assignee one.
+ */
+function withoutRoleMentions(text: string): string {
+  return text.replace(
+    /\b(assigned to|assignee'?s?(?:\s+(?:is|are))?|assign(?:ing|ed)? to|managed by|manager'?s?(?:\s+(?:is|are))?|project manager(?:\s+is)?|pm(?:\s+is)?|owned by|owner(?:\s+is)?|reviewer(?:\s+is)?)\b[^,.;]*/gi,
+    ' ',
+  );
+}
+
 /** The permitted creator whose first name appears in `text`, if any. */
 function creatorNamedIn(text: string): string | null {
   const haystack = text.toLowerCase();
@@ -798,15 +815,17 @@ export function registerTools(server: ToolServer, env: Env): void {
         (name) => TASK_CREATORS[name] === a.acting_user_id,
       );
 
-      // The quoted words must actually name the person selected. This is the check
-      // that catches an inferred creator: in a request that never mentions them,
-      // no honest quote can contain their name.
-      if (!chosenName || creatorNamedIn(quote) !== chosenName) {
+      // The quoted words must name the selected person AS THE CREATOR. Assignee and
+      // manager phrases are stripped first, so quoting "assigned to Faizal Khan"
+      // cannot stand in for a creator. This is the check that catches an inferred
+      // creator: in a request that never names one, no honest quote survives it.
+      const creatorEvidence = withoutRoleMentions(quote);
+      if (!chosenName || creatorNamedIn(creatorEvidence) !== chosenName) {
         throw new Error(
-          `The creator you selected (${chosenName ?? 'unknown'}) does not appear in the text `
-          + `you quoted from the user: "${quote}". A creator must be taken from what the user `
-          + `actually wrote, never inferred from the assignee, the manager, an earlier `
-          + `message or another task. ${CREATOR_QUESTION}`,
+          `The creator you selected (${chosenName ?? 'unknown'}) is not named as the CREATOR in `
+          + `the text you quoted from the user: "${quote}". Naming somebody as the assignee or `
+          + `the manager does not make them the creator, and a creator must never be inferred `
+          + `from an earlier message or another task. ${CREATOR_QUESTION}`,
         );
       }
 
