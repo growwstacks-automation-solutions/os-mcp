@@ -85,6 +85,32 @@ const MILESTONE_STATUS = z.enum([
 const PRIORITY = z.enum(['low', 'medium', 'high']);
 
 // ---------------------------------------------------------------------------
+// PERMITTED TASK CREATORS
+//
+// Only these people may be recorded as created_by. Enforced as a z.enum rather
+// than a describe() note for two reasons:
+//   1. The server REJECTS anything else, so a wrong creator cannot be written
+//      whatever the model decides to send.
+//   2. The JSON Schema then advertises exactly these ids, so the model sees a
+//      closed two-way choice instead of a free uuid field it can fill from
+//      whatever name happens to be lying around in its context.
+//
+// To add someone: add a line here and redeploy. Kept deliberately small - this
+// is an attribution allowlist, not a permission system (RLS still does that).
+// ---------------------------------------------------------------------------
+const TASK_CREATORS: Record<string, string> = {
+  'Faizal Khan': '00b5232b-2f84-4b7e-ae98-26ccf683e7c5',
+  'Manish Mandot': '4e0d5b3b-fe89-485b-be6a-5909cf272d5c',
+};
+
+const CREATOR_IDS = Object.values(TASK_CREATORS) as [string, ...string[]];
+
+/** "Faizal Khan = <id>; Manish Mandot = <id>" - inlined into the description. */
+const CREATOR_HINT = Object.entries(TASK_CREATORS)
+  .map(([name, id]) => `${name} = ${id}`)
+  .join('; ');
+
+// ---------------------------------------------------------------------------
 // ASK-OR-SKIP
 //
 // The rule from the team: never assume a value, always ask — but let the user
@@ -688,10 +714,10 @@ export function registerTools(server: ToolServer, env: Env): void {
       // Attribution ONLY: this sets created_by and never touches
       // app.current_user_id, so RLS authorizes the call exactly as before.
       acting_user_id: askOrSkip(
-        z.string().uuid(),
+        z.enum(CREATOR_IDS),
         'the MCP system account is recorded as the creator instead of a person',
       ).describe(
-        'REQUIRED — ASK THE USER who is creating this task ("who should I record as the creator?"), then resolve that name with find_user and pass their id. Pass "skip" to record the MCP system account. Never guess, and never assume it is the assignee or the manager.',
+        `REQUIRED — who is creating this task. ONLY these two people are permitted: ${CREATOR_HINT}. ASK THE USER which of the two they are unless they have said so in THIS request. Do NOT infer it from earlier messages, from another task, from the assignee or from the manager, and do NOT call find_user for this field — the two ids above are the only accepted values. Pass "skip" to record the MCP system account instead.`,
       ),
     },
     guard(async (a: any) => {
