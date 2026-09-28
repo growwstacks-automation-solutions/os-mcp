@@ -241,6 +241,57 @@ function askOrSkipArray<T extends z.ZodTypeAny>(inner: T, ifSkipped: string) {
     );
 }
 
+/**
+ * coerceNumber / coerceBoolean - the same rescue as coerceArray, for scalars.
+ *
+ * A client may serialise 2 as "2" and true as "true". Zod then rejects it, and
+ * for an ask-or-skip union the failure reads "expected number, received string"
+ * AND "expected 'skip'" at once - which is what made estimated_hours unusable
+ * from the connector even though the user had given a perfectly good number.
+ *
+ * Both only WIDEN what parses. A real number or boolean is returned untouched,
+ * and "skip" is passed straight through so the union's literal branch still
+ * matches, so nothing that works today changes.
+ */
+function coerceNumber(v: unknown): unknown {
+  if (typeof v !== 'string') return v;
+  const s = v.trim();
+  if (s === '' || s === SKIP) return v;
+  // ONLY a string that is entirely a number. "2 hours", "two" and "2x" must
+  // still be rejected rather than silently becoming 2 or NaN - a wrong number
+  // written to the database is worse than a validation error.
+  if (!/^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/.test(s)) return v;
+  const n = Number(s);
+  return Number.isFinite(n) ? n : v;
+}
+
+function coerceBoolean(v: unknown): unknown {
+  if (typeof v !== 'string') return v;
+  const s = v.trim().toLowerCase();
+  if (s === 'true') return true;
+  if (s === 'false') return false;
+  return v;
+}
+
+/** Wrap any numeric field so a stringified number still parses. */
+function num<T extends z.ZodTypeAny>(inner: T) {
+  return z.preprocess(coerceNumber, inner);
+}
+
+/** Wrap any boolean field so "true" / "false" still parse. */
+function bool<T extends z.ZodTypeAny>(inner: T) {
+  return z.preprocess(coerceBoolean, inner);
+}
+
+/** askOrSkip for a NUMBER field - same contract, tolerant of stringified input. */
+function askOrSkipNumber<T extends z.ZodTypeAny>(inner: T, ifSkipped: string) {
+  return z
+    .preprocess(coerceNumber, z.union([inner, z.literal(SKIP)]))
+    .describe(
+      `REQUIRED — ask the user. If they don't want to give one, pass "skip" (${ifSkipped}). Never invent a value.`,
+    );
+}
+
 /** An OPTIONAL array field, equally tolerant of stringified input. */
 function optArray<T extends z.ZodTypeAny>(inner: T) {
   return z.preprocess(coerceArray, inner.optional());
@@ -440,7 +491,7 @@ export function registerTools(server: ToolServer, env: Env): void {
     'Find companies by name, website or display id. Use before create_company to avoid duplicates.',
     {
       query: z.string().min(1).max(200),
-      limit: z.number().int().min(1).max(100).default(20),
+      limit: num(z.number().int().min(1).max(100).default(20)),
     },
     guard(async (a: any) => {
       const like = `%${a.query}%`;
@@ -551,13 +602,13 @@ export function registerTools(server: ToolServer, env: Env): void {
         .describe(
           'REQUIRED. The pipeline stage the deal starts in, from list_pipelines. If the user has not said which stage, ASK THEM — do not default to the first stage.',
         ),
-      deal_value: askOrSkip(z.number(), 'no value is recorded').describe(
+      deal_value: askOrSkipNumber(z.number(), 'no value is recorded').describe(
         'REQUIRED — ask the user for the deal amount. Pass "skip" for none.',
       ),
       currency: askOrSkip(z.string().length(3), 'no currency is recorded').describe(
         'REQUIRED — ask the user for the 3-letter code, e.g. USD or INR. Pass "skip" for none.',
       ),
-      initial_deal_amount: askOrSkip(z.number(), 'no initial amount is recorded').describe(
+      initial_deal_amount: askOrSkipNumber(z.number(), 'no initial amount is recorded').describe(
         'REQUIRED — ask the user for the initial amount. Pass "skip" for none.',
       ),
       lead_type: askOrSkip(z.string().max(200), 'no lead type is recorded').describe(
@@ -659,7 +710,7 @@ export function registerTools(server: ToolServer, env: Env): void {
       status: askOrSkip(z.string(), 'defaults to "upcoming"').describe(
         'REQUIRED — ask the user. Real values from get_statuses("project"): upcoming, in_progress, client_pending, on_hold, payment_pending, handover, client_review, completed, internal, lost. Pass "skip" to default to "upcoming".',
       ),
-      estimated_hours: askOrSkip(z.number(), 'no estimate is recorded').describe(
+      estimated_hours: askOrSkipNumber(z.number(), 'no estimate is recorded').describe(
         'REQUIRED — ask the user for the estimated hours. Pass "skip" for none.',
       ),
       start_date: askOrSkip(z.string(), 'no start date is set').describe(
@@ -740,7 +791,7 @@ export function registerTools(server: ToolServer, env: Env): void {
       plan_due_date: askOrSkip(z.string(), 'no due date is set').describe(
         'REQUIRED — ask the user for the due date (YYYY-MM-DD). Pass "skip" for none.',
       ),
-      estimated_hours: askOrSkip(z.number().min(0).max(100000), 'no estimate is recorded').describe(
+      estimated_hours: askOrSkipNumber(z.number().min(0).max(100000), 'no estimate is recorded').describe(
         'REQUIRED — ask the user for the estimated hours. Pass "skip" for none.',
       ),
       requirement: askOrSkip(z.string().max(20000), 'the requirement box is left empty').describe(
@@ -912,11 +963,11 @@ export function registerTools(server: ToolServer, env: Env): void {
       status: askOrSkip(MILESTONE_STATUS, 'defaults to "not_started"').describe(
         'REQUIRED — ask the user: not_started, in_progress, in_review, client_pending, on_hold or done. Pass "skip" to default to "not_started".',
       ),
-      estimated_hours: askOrSkip(z.number(), 'no estimate is recorded').describe(
+      estimated_hours: askOrSkipNumber(z.number(), 'no estimate is recorded').describe(
         'REQUIRED — ask the user for the estimated hours. Pass "skip" for none.',
       ),
       target_date: z.string().optional().describe('YYYY-MM-DD. Optional.'),
-      price: z.number().optional().describe('Milestones are billable line items. Optional.'),
+      price: num(z.number().optional().describe('Milestones are billable line items. Optional.')),
       currency: z.string().max(3).optional(),
     },
     guard(async (a: any) => {
@@ -1016,7 +1067,7 @@ export function registerTools(server: ToolServer, env: Env): void {
         .max(200)
         .optional()
         .describe('Matches display_id, transaction_ref, deal/project/client name.'),
-      limit: z.number().int().min(1).max(500).default(100),
+      limit: num(z.number().int().min(1).max(500).default(100)),
     },
     guard(async (a: any) => {
       const statuses = a.status?.length ? a.status : null;
@@ -1074,9 +1125,9 @@ export function registerTools(server: ToolServer, env: Env): void {
     'Record a payment against a deal. If developers are given, their percent shares must total 100 (enforced by the database).',
     {
       deal_id: z.string().uuid().describe('Required. Use find_deal.'),
-      amount: z.number(),
+      amount: num(z.number()),
       currency: z.string().length(3),
-      submitted_amount: z.number().describe('Required alongside amount.'),
+      submitted_amount: num(z.number().describe('Required alongside amount.')),
       status: z.string().optional().describe('payment_status; defaults to "forecast".'),
       project_id: z.string().uuid().optional(),
       milestone_id: z.string().uuid().optional(),
@@ -1086,16 +1137,16 @@ export function registerTools(server: ToolServer, env: Env): void {
       transaction_ref: z.string().optional(),
       invoice_no: z.string().max(120).optional(),
       note: z.string().optional(),
-      received_amount_inr: z.number().optional(),
+      received_amount_inr: num(z.number().optional()),
       platform_name: z.string().optional(),
       billing_type: z.enum(['fixed', 'hourly']).optional(),
-      hours_logged: z.number().optional(),
-      hourly_rate: z.number().optional(),
+      hours_logged: num(z.number().optional()),
+      hourly_rate: num(z.number().optional()),
       developers: z
         .array(
           z.object({
             user_id: z.string().uuid(),
-            percent_share: z.number().min(0).max(100),
+            percent_share: num(z.number().min(0).max(100)),
           }),
         )
         .optional()
@@ -1328,8 +1379,8 @@ export function registerTools(server: ToolServer, env: Env): void {
     {
       deal_id: z.string().uuid(),
       name: z.string().min(1).max(300).optional(),
-      deal_value: z.number().optional(),
-      initial_deal_amount: z.number().optional(),
+      deal_value: num(z.number().optional()),
+      initial_deal_amount: num(z.number().optional()),
       currency: z.string().length(3).optional(),
       payment_type: z.string().optional(),
       close_date: z.string().optional().describe('YYYY-MM-DD'),
@@ -1380,7 +1431,7 @@ export function registerTools(server: ToolServer, env: Env): void {
       start_date: z.string().optional().describe('YYYY-MM-DD'),
       estimated_completion_date: z.string().optional().describe('YYYY-MM-DD'),
       actual_completion_date: z.string().optional().describe('YYYY-MM-DD'),
-      estimated_hours: z.number().optional(),
+      estimated_hours: num(z.number().optional()),
       project_manager_id: z.string().uuid().optional().describe('Use find_user.'),
       requirement: z.string().max(20000).optional(),
       overview: z.string().max(20000).optional(),
@@ -1431,8 +1482,8 @@ export function registerTools(server: ToolServer, env: Env): void {
       start_date: z.string().optional().describe('YYYY-MM-DD'),
       target_date: z.string().optional().describe('YYYY-MM-DD'),
       actual_completion_date: z.string().optional().describe('YYYY-MM-DD'),
-      estimated_hours: z.number().optional(),
-      price: z.number().optional(),
+      estimated_hours: num(z.number().optional()),
+      price: num(z.number().optional()),
       currency: z.string().max(3).optional(),
       clear_fields: z
         .array(z.enum(['milestone_manager_id', 'start_date', 'target_date',
@@ -1478,8 +1529,8 @@ export function registerTools(server: ToolServer, env: Env): void {
       plan_due_date: z.string().optional().describe('YYYY-MM-DD'),
       execution_start_date: z.string().optional().describe('YYYY-MM-DD'),
       execution_end_date: z.string().optional().describe('YYYY-MM-DD'),
-      estimated_hours: z.number().min(0).max(100000).optional(),
-      time_reported_hours: z.number().optional(),
+      estimated_hours: num(z.number().min(0).max(100000).optional()),
+      time_reported_hours: num(z.number().optional()),
       delivery_state: z.enum(['not_delivered', 'delivered']).optional(),
       loom_url: z.string().max(1000).optional(),
       requirement: z.string().max(20000).optional(),
@@ -1527,11 +1578,11 @@ export function registerTools(server: ToolServer, env: Env): void {
     'Update fields on a payment. Only what you pass changes. For status use set_payment_status.',
     {
       payment_id: z.string().uuid(),
-      amount: z.number().optional(),
+      amount: num(z.number().optional()),
       currency: z.string().length(3).optional(),
-      submitted_amount: z.number().optional(),
-      received_amount_inr: z.number().optional(),
-      forecast: z.number().optional(),
+      submitted_amount: num(z.number().optional()),
+      received_amount_inr: num(z.number().optional()),
+      forecast: num(z.number().optional()),
       payment_type: z.string().optional(),
       payment_date: z.string().optional().describe('YYYY-MM-DD'),
       billing_date: z.string().optional().describe('YYYY-MM-DD'),
@@ -1540,8 +1591,8 @@ export function registerTools(server: ToolServer, env: Env): void {
       note: z.string().max(5000).optional(),
       platform_name: z.string().max(200).optional(),
       billing_type: z.enum(['fixed', 'hourly']).optional(),
-      hours_logged: z.number().optional(),
-      hourly_rate: z.number().optional(),
+      hours_logged: num(z.number().optional()),
+      hourly_rate: num(z.number().optional()),
       screenshot_url: z.string().max(1000).optional(),
       clear_fields: z
         .array(z.enum(['payment_date', 'billing_date', 'transaction_ref', 'invoice_no',
@@ -1731,14 +1782,16 @@ export function registerTools(server: ToolServer, env: Env): void {
       status: optArray(z.array(z.string())),
       due_before: z.string().optional().describe('plan_due_date <= YYYY-MM-DD'),
       search: z.string().max(200).optional().describe('Matches title or display id.'),
-      include_management: z.boolean().default(false).describe('Include management-stream tasks.'),
-      full: z
-        .boolean()
-        .default(false)
-        .describe(
-          'Return the complete field feed per task (requirement, details, delivery state, execution dates, reported hours, loom url, spine ids and timestamps) instead of the summary columns. Off by default because requirement/details can be very large across many rows.',
-        ),
-      limit: z.number().int().min(1).max(500).default(100),
+      include_management: bool(z.boolean().default(false).describe('Include management-stream tasks.')),
+      full: bool(
+        z
+          .boolean()
+          .default(false)
+          .describe(
+            'Return the complete field feed per task (requirement, details, delivery state, execution dates, reported hours, loom url, spine ids and timestamps) instead of the summary columns. Off by default because requirement/details can be very large across many rows.',
+          ),
+      ),
+      limit: num(z.number().int().min(1).max(500).default(100)),
     },
     guard(async (a: any) => {
       const statuses = a.status?.length ? a.status : null;
@@ -2290,7 +2343,7 @@ export function registerTools(server: ToolServer, env: Env): void {
     'Find contacts by name, email, display id or phone.',
     {
       query: z.string().min(1).max(200),
-      limit: z.number().int().min(1).max(100).default(20),
+      limit: num(z.number().int().min(1).max(100).default(20)),
     },
     guard(async (a: any) => {
       const like = `%${a.query}%`;
@@ -2328,7 +2381,7 @@ export function registerTools(server: ToolServer, env: Env): void {
         .string()
         .optional()
         .describe('Exact role filter, e.g. "developer", "pm", "sales", "admin", "finance".'),
-      limit: z.number().int().min(1).max(200).default(50),
+      limit: num(z.number().int().min(1).max(200).default(50)),
     },
     guard(async (a: any) => {
       const q = a.query ? `%${a.query}%` : null;
@@ -2357,7 +2410,7 @@ export function registerTools(server: ToolServer, env: Env): void {
     'Find deals by name or display id. Needed before create_payment.',
     {
       query: z.string().min(1).max(200),
-      limit: z.number().int().min(1).max(100).default(20),
+      limit: num(z.number().int().min(1).max(100).default(20)),
     },
     guard(async (a: any) => {
       const like = `%${a.query}%`;
@@ -2380,7 +2433,7 @@ export function registerTools(server: ToolServer, env: Env): void {
     'Find projects by name or display id.',
     {
       query: z.string().min(1).max(200),
-      limit: z.number().int().min(1).max(100).default(20),
+      limit: num(z.number().int().min(1).max(100).default(20)),
     },
     guard(async (a: any) => {
       const like = `%${a.query}%`;
@@ -2404,7 +2457,7 @@ export function registerTools(server: ToolServer, env: Env): void {
     {
       query: z.string().max(200).optional(),
       project_id: z.string().uuid().optional(),
-      limit: z.number().int().min(1).max(100).default(20),
+      limit: num(z.number().int().min(1).max(100).default(20)),
     },
     guard(async (a: any) => {
       const q = a.query ? `%${a.query}%` : null;
