@@ -53,6 +53,26 @@ export async function asUser<T = Record<string, unknown>>(
 }
 
 /**
+ * asNamedUser — like asUser, but act as a SPECIFIC person instead of the MCP
+ * service account. Only for writes whose RLS policy pins an author column to
+ * fn_me() (conversation_entries.sender_user_id), where attribution cannot be
+ * written any other way. The statement is authorized with THAT person's
+ * permissions. Callers must restrict `uid` to an explicit allowlist.
+ */
+export async function asNamedUser<T = Record<string, unknown>>(
+  env: Env,
+  uid: string,
+  build: (sql: SqlClient) => NeonQuery,
+): Promise<T[]> {
+  const sql: SqlClient = neon(env.DATABASE_URL);
+  const res = await sql.transaction([
+    sql`select set_config('app.current_user_id', ${uid}, true)`,
+    build(sql),
+  ]);
+  return res[1] as T[];
+}
+
+/**
  * asUserWithReason — like asUser, but ALSO sets the `app.audit_reason` GUC so the
  * fn_audit trigger records WHY on the same audit_log row. Required for every
  * archive ("delete") — the OS never hard-deletes and always demands a reason.

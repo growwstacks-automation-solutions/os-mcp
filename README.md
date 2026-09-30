@@ -81,6 +81,13 @@ credential protections stop applying.
 | `add_project_member` / `remove_project_member` | Project team (`pm` or `developer`) |
 | `set_contact_owner` | Contact ownership (join row + cached pointer) |
 
+**Task discussion**
+
+| Tool | What it does |
+|---|---|
+| `add_task_comment` | Post a comment to a task's Discussion thread under Faizal Khan's or Manish Mandot's name (asks which if not stated) |
+| `get_task_discussion` | Read a task's Discussion thread, oldest first |
+
 **Archive**
 
 | Tool | What it does |

@@ -12,7 +12,7 @@
 //   * "Delete" means archive-with-reason; no tool here deletes anything.
 
 import { z } from 'zod';
-import { asUser, asUserMany, asUserWithReason, actorUid, type Env } from './db';
+import { asUser, asUserMany, asUserWithReason, asNamedUser, actorUid, type Env } from './db';
 
 // The MCP server object handed to us by createMcpHandler.
 type ToolServer = {
@@ -130,6 +130,14 @@ const CREATOR_QUESTION =
   + 'Only those people may be recorded. When the user answers, call create_task again, '
   + 'putting their answer in creator_quote. Do not choose on their behalf, and do not retry '
   + 'with the same values.';
+
+/** The same question for a Discussion comment (add_task_comment). */
+const COMMENT_AUTHOR_QUESTION =
+  'ASK THE USER this question before trying again: "Who should this comment be posted as — '
+  + `${Object.keys(TASK_CREATORS).join(' or ')}?" `
+  + 'Only those people may post. When the user answers, call add_task_comment again, putting '
+  + 'their answer in author_quote. Do not choose on their behalf, and do not retry with the '
+  + 'same values.';
 
 /**
  * Remove the phrases that name an ASSIGNEE or a MANAGER.
@@ -2256,6 +2264,130 @@ export function registerTools(server: ToolServer, env: Env): void {
         ORDER BY at.created_at DESC
       `),
     ),
+  );
+
+  // =========================================================================
+  // TASK DISCUSSION — the "Discussion" thread on a task.
+  //
+  // The OS stores each comment as a conversation_entries row on the task, in
+  // exactly this shape: channel='slack', direction='outbound', sender_user_id =
+  // the author, no external ids, occurred_at = now. We write the same shape so
+  // MCP comments sit in the same thread as ones typed in the app.
+  //
+  // RLS (conversation_insert) only allows sender_user_id to be NULL or fn_me(),
+  // so unlike tasks.created_by the author cannot simply be written as a column
+  // value. Instead the insert runs AS the author (asNamedUser): fn_me() is then
+  // that person and the comment appears under their name, exactly like one
+  // typed in the app. That is why the author is limited to TASK_CREATORS and
+  // must be backed by the user's own words — the same checks as create_task.
+  // Only this one statement runs as them; every other tool stays on the MCP
+  // service account.
+  // =========================================================================
+  server.tool(
+    'add_task_comment',
+    `Post a comment to a task's Discussion thread, under the name of the person posting it. ASK THE USER who the comment should be posted as (${Object.keys(TASK_CREATORS).join(' or ')}) if they have not said in this request — never guess.`,
+    {
+      task_id: z.string().uuid().describe('Use list_tasks to find it.'),
+      body: z.string().trim().min(1).max(20000).describe('The comment text, exactly as the user wants it posted.'),
+      author_id: z.enum(CREATOR_CHOICES).describe(
+        `REQUIRED — who the comment is posted as. The ONLY permitted authors are: ${CREATOR_HINT}. Pass one of those ids if and ONLY IF the user named who is posting in THIS request. In EVERY other case pass "${CREATOR_NOT_STATED}" — including when they named nobody, named anybody else, or you would be taking it from an earlier message or the task's assignee/manager. That returns an error with the question to ask the user; that is the intended flow. Never guess.`,
+      ),
+      author_quote: z
+        .string()
+        .min(1)
+        .max(500)
+        .describe(
+          `REQUIRED — copy, VERBATIM, the words from the user request that say who is posting (for example "post as Faizal" or "from Manish"). Pass "${CREATOR_QUOTE_NONE}" if they did not say. The server checks this text names the person chosen in author_id and refuses the call if it does not.`,
+        ),
+    },
+    guard(async (a: any) => {
+      const quote = String(a.author_quote ?? '').trim();
+      if (a.author_id === CREATOR_NOT_STATED || quote.toLowerCase() === CREATOR_QUOTE_NONE) {
+        throw new Error(`The author of this comment has not been specified. ${COMMENT_AUTHOR_QUESTION}`);
+      }
+      const chosenName = Object.keys(TASK_CREATORS).find(
+        (name) => TASK_CREATORS[name] === a.author_id,
+      );
+      // The quote must name the chosen person and ONLY them: "tell Manish the API
+      // is ready, from Faizal" names both, so it cannot settle who is posting.
+      const evidence = withoutRoleMentions(quote).toLowerCase();
+      const named = Object.keys(TASK_CREATORS).filter((name) =>
+        evidence.includes(name.split(' ')[0].toLowerCase()),
+      );
+      if (!chosenName || named.length !== 1 || named[0] !== chosenName) {
+        throw new Error(
+          `The author you selected (${chosenName ?? 'unknown'}) is not clearly named as the person `
+          + `posting in the text you quoted from the user: "${quote}". ${COMMENT_AUTHOR_QUESTION}`,
+        );
+      }
+
+      const body = String(a.body).trim();
+      // source=mcp keeps MCP-posted comments distinguishable in the data even
+      // though they show under the author's name.
+      const metadata = { source: 'mcp' };
+      // fn_validate_parent rejects a missing/archived task; RLS rejects a task
+      // the author cannot see. Either way nothing is written.
+      const rows = await asNamedUser(env, a.author_id, (sql) => sql`
+        WITH new_entry AS (
+          INSERT INTO conversation_entries (
+            parent_type, parent_id, channel, direction, sender_user_id, body, occurred_at, metadata
+          )
+          VALUES (
+            'task'::entity_type,
+            ${a.task_id}::uuid,
+            'slack'::conversation_channel,
+            'outbound'::message_direction,
+            fn_me(),
+            ${body},
+            now(),
+            ${JSON.stringify(metadata)}::jsonb
+          )
+          RETURNING id, parent_id, sender_user_id, body, occurred_at, metadata
+        )
+        SELECT ne.id, ne.parent_id AS task_id, t.display_id AS task_display_id,
+               u.full_name AS sender_name, ne.body, ne.occurred_at, ne.metadata
+        FROM new_entry ne
+        LEFT JOIN tasks t ON t.id = ne.parent_id
+        LEFT JOIN users u ON u.id = ne.sender_user_id
+      `);
+      if (rows.length === 0) throw new Error('Not permitted to comment on that task, or it does not exist.');
+      return rows[0];
+    }),
+  );
+
+  server.tool(
+    'get_task_discussion',
+    'Read a task\'s Discussion thread, oldest comment first. Returns the most recent `limit` comments.',
+    {
+      task_id: z.string().uuid().describe('Use list_tasks to find it.'),
+      limit: num(z.number().int().min(1).max(500).default(100)),
+    },
+    guard(async (a: any) => {
+      const tasks = await asUser<{ id: string; display_id: string; title: string }>(env, (sql) => sql`
+        SELECT id, display_id, title FROM tasks WHERE id = ${a.task_id}::uuid
+      `);
+      // Not-found and RLS-denied are deliberately indistinguishable.
+      if (tasks.length === 0) throw new Error('Task not found or not visible.');
+      const comments = await asUser(env, (sql) => sql`
+        SELECT * FROM (
+          SELECT ce.id, ce.body, ce.occurred_at,
+                 ce.channel::text AS channel, ce.direction::text AS direction,
+                 COALESCE(u.full_name, ct.full_name) AS sender_name,
+                 ce.sender_user_id, ce.sender_contact_id,
+                 COALESCE(ce.metadata->>'source' = 'mcp', false) AS posted_via_mcp
+          FROM conversation_entries ce
+          LEFT JOIN users u     ON u.id = ce.sender_user_id
+          LEFT JOIN contacts ct ON ct.id = ce.sender_contact_id
+          WHERE ce.parent_type = 'task'::entity_type
+            AND ce.parent_id = ${a.task_id}::uuid
+            AND ce.archived_at IS NULL
+          ORDER BY ce.occurred_at DESC, ce.created_at DESC
+          LIMIT ${a.limit ?? 100}
+        ) recent
+        ORDER BY occurred_at, id
+      `);
+      return { task: tasks[0], count: comments.length, comments };
+    }),
   );
 
   // =========================================================================
