@@ -81,6 +81,22 @@ credential protections stop applying.
 | `add_project_member` / `remove_project_member` | Project team (`pm` or `developer`) |
 | `set_contact_owner` | Contact ownership (join row + cached pointer) |
 
+**Attachments**
+
+| Tool | What it does |
+|---|---|
+| `start_attachment_upload` | Step 1 for a real file/image: returns a signed upload URL (15 min, single use) and a `curl` command |
+| `finalize_attachment_upload` | Step 2: re-reads the stored file and confirms it is complete |
+| `add_attachment` | Links, or small files (< 256 KB) as base64. Rejects empty, truncated or mislabelled files |
+| `list_attachments` | Files and links on a record |
+
+The file itself never goes through the tool call. The caller's sandbox runs the
+returned `curl -X PUT --data-binary @file <url>`; the Worker (`PUT /upload/<token>`)
+checks the size and the content (PNG/JPEG/GIF/WebP/PDF, both ends of the file)
+and stores nothing unless everything passes. Allowed: png, jpeg, gif, webp, pdf, up
+to 5 MB (`MAX_FILE_BYTES` in `src/uploads.ts`). The sandbox must be allowed to reach
+this Worker's address (claude.ai: code execution network access).
+
 **Task discussion**
 
 | Tool | What it does |

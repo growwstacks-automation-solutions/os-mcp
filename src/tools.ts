@@ -13,6 +13,17 @@
 
 import { z } from 'zod';
 import { asUser, asUserMany, asUserWithReason, asNamedUser, actorUid, type Env } from './db';
+import {
+  ALLOWED_MIME,
+  MAX_FILE_BYTES,
+  MAX_INLINE_BYTES,
+  decodeBase64Strict,
+  newUploadClaims,
+  signUpload,
+  storeAttachment,
+  validateContent,
+  verifyStored,
+} from './uploads';
 
 // The MCP server object handed to us by createMcpHandler.
 type ToolServer = {
@@ -377,7 +388,7 @@ function changedFields(a: Record<string, unknown>, idKey: string): string[] {
   );
 }
 
-export function registerTools(server: ToolServer, env: Env): void {
+export function registerTools(server: ToolServer, env: Env, origin = ''): void {
   // =========================================================================
   // 0. COMPANIES — the ACCOUNT. A contact is a person; a company is the
   //    organisation they belong to. The "create a company" intake (name,
@@ -2163,7 +2174,7 @@ export function registerTools(server: ToolServer, env: Env): void {
   // =========================================================================
   server.tool(
     'add_attachment',
-    'Attach a file or link to any record. For a file, pass file_base64 and the MCP stores the contents; for a link, just pass the url.',
+    `Attach a link, or a SMALL file (under ${MAX_INLINE_BYTES / 1024} KB) as file_base64, to any record. For any real file or image use start_attachment_upload instead — NEVER type or paste file contents yourself, and never pass a shell command as file_base64. If you cannot read the file's real bytes, say so and ask the user for a link.`,
     {
       parent_type: z.enum(['company', 'contact', 'deal', 'project', 'milestone', 'task', 'payment']),
       parent_id: z.string().uuid(),
@@ -2190,44 +2201,57 @@ export function registerTools(server: ToolServer, env: Env): void {
         throw new Error('Pass url for a link, or file_base64 for a file.');
       }
       const attachmentId = crypto.randomUUID();
-      const sizeBytes = isFile ? Math.floor((a.file_base64.length * 3) / 4) : null;
 
-      // TWO statements, one transaction: the attachment_blobs INSERT policy does
-      // `EXISTS (SELECT 1 FROM attachments …)`, which cannot see a row inserted
-      // by the SAME statement. Splitting them makes the parent visible to the
-      // blob's policy check while keeping both atomic.
-      const queries = (sql: any) => {
-        const out = [
-          sql`
-            INSERT INTO attachments (
-              id, parent_type, parent_id, kind, title, url,
-              mime_type, size_bytes, purpose, uploaded_by
-            )
-            VALUES (
-              ${attachmentId}::uuid,
-              ${a.parent_type}::entity_type,
-              ${a.parent_id}::uuid,
-              ${isFile ? 'file' : 'link'}::attachment_kind,
-              ${a.title},
-              ${a.url ?? a.title},
-              ${a.mime_type ?? null},
-              ${sizeBytes},
-              ${a.purpose ?? null},
-              ${actorUid(env)}::uuid
-            )
-          `,
-        ];
-        if (isFile) {
-          out.push(sql`
-            INSERT INTO attachment_blobs (attachment_id, data_base64)
-            VALUES (${attachmentId}::uuid, ${a.file_base64})
-          `);
+      if (isFile) {
+        // Reject anything that is not a complete, correctly-labelled file. The
+        // old code stored whatever arrived, which is how a 14-byte shell command
+        // ended up saved as a "PNG".
+        const bytes = decodeBase64Strict(a.file_base64);
+        if (bytes.length > MAX_INLINE_BYTES) {
+          throw new Error(
+            `file_base64 is ${bytes.length} bytes; this route only takes files up to ${MAX_INLINE_BYTES} bytes. `
+            + 'Use start_attachment_upload for larger files.',
+          );
         }
-        out.push(sql`SELECT id FROM attachments WHERE id = ${attachmentId}::uuid`);
-        return out;
-      };
+        const mime = a.mime_type ?? '';
+        if (!(ALLOWED_MIME as readonly string[]).includes(mime)) {
+          throw new Error(`mime_type is required and must be one of: ${ALLOWED_MIME.join(', ')}.`);
+        }
+        const bad = validateContent(bytes, mime);
+        if (bad) throw new Error(`${bad} Nothing was stored.`);
+        await storeAttachment(env, {
+          id: attachmentId,
+          parentType: a.parent_type,
+          parentId: a.parent_id,
+          title: a.title,
+          mime,
+          purpose: a.purpose ?? null,
+          bytes,
+        });
+        return {
+          id: attachmentId,
+          parent_type: a.parent_type,
+          parent_id: a.parent_id,
+          kind: 'file',
+          title: a.title,
+          size_bytes: bytes.length,
+        };
+      }
 
-      const rows = await asUserMany(env, queries);
+      const rows = await asUserMany(env, (sql) => [
+        sql`
+          INSERT INTO attachments (
+            id, parent_type, parent_id, kind, title, url,
+            mime_type, size_bytes, purpose, uploaded_by
+          )
+          VALUES (
+            ${attachmentId}::uuid, ${a.parent_type}::entity_type, ${a.parent_id}::uuid,
+            'link'::attachment_kind, ${a.title}, ${a.url}, ${a.mime_type ?? null},
+            NULL, ${a.purpose ?? null}, ${actorUid(env)}::uuid
+          )
+        `,
+        sql`SELECT id FROM attachments WHERE id = ${attachmentId}::uuid`,
+      ]);
       if (rows.length === 0) {
         throw new Error('Not permitted to attach to that record, or the record does not exist.');
       }
@@ -2235,10 +2259,81 @@ export function registerTools(server: ToolServer, env: Env): void {
         id: attachmentId,
         parent_type: a.parent_type,
         parent_id: a.parent_id,
-        kind: isFile ? 'file' : 'link',
+        kind: 'link',
         title: a.title,
-        size_bytes: sizeBytes,
+        size_bytes: null,
       };
+    }),
+  );
+
+  // -------------------------------------------------------------------------
+  // PRESIGNED UPLOAD — for real files and images.
+  //
+  // A tool call is text the model types, so a 470 KB image (~630K characters)
+  // cannot go through one. Instead: start_attachment_upload returns a signed URL,
+  // the caller's sandbox sends the raw file to it (curl), and the Worker checks
+  // size + content before storing anything. finalize_attachment_upload then
+  // re-reads the stored file and confirms it is whole.
+  // -------------------------------------------------------------------------
+  server.tool(
+    'start_attachment_upload',
+    `Step 1 of 2 for attaching a real file or image (png, jpeg, gif, webp, pdf; up to ${MAX_FILE_BYTES / (1024 * 1024)} MB) to a record. Returns a short-lived upload URL and a ready-to-run curl command. You MUST then run that curl command in your code sandbox against the actual file — do NOT paste or type the file contents into any tool call — and then call finalize_attachment_upload. Get file_size_bytes from the real file (e.g. wc -c), never estimate it. If you have no sandbox that can read the file and reach this URL, tell the user and ask for a link instead.`,
+    {
+      parent_type: z.enum(['company', 'contact', 'deal', 'project', 'milestone', 'task', 'payment']),
+      parent_id: z.string().uuid().describe('The record to attach to, e.g. a task id from list_tasks.'),
+      file_name: z.string().min(1).max(300).describe('Display name, e.g. "Screenshot.png".'),
+      mime_type: z.enum(ALLOWED_MIME),
+      file_size_bytes: num(z.number().int().min(1).max(MAX_FILE_BYTES)).describe(
+        'Exact size of the file in bytes, measured from the real file.',
+      ),
+      purpose: z.string().max(200).optional(),
+    },
+    guard(async (a: any) => {
+      // Fail now, not after the sandbox has already sent the bytes: the record
+      // must exist and be editable by the acting user.
+      const visible = await asUser(env, (sql) => sql`
+        SELECT 1 AS ok WHERE fn_can_edit(${a.parent_type}::entity_type, ${a.parent_id}::uuid)
+      `);
+      if (visible.length === 0) {
+        throw new Error('Not permitted to attach to that record, or the record does not exist.');
+      }
+      const claims = await newUploadClaims({
+        pt: a.parent_type,
+        pid: a.parent_id,
+        title: a.file_name,
+        mime: a.mime_type,
+        size: a.file_size_bytes,
+        purpose: a.purpose ?? null,
+      });
+      const token = await signUpload(env, claims);
+      const uploadUrl = `${origin}/upload/${encodeURIComponent(token)}`;
+      return {
+        attachment_id: claims.a,
+        upload_url: uploadUrl,
+        expires_in_minutes: 15,
+        curl_command:
+          `curl -sS -X PUT -H "Content-Type: ${a.mime_type}" --data-binary @"<path-to-file>" "${uploadUrl}"`,
+        next_steps: [
+          'Run the curl command in your sandbox, replacing <path-to-file> with the real file path.',
+          'A response containing "ok":true means the file was stored. Any error means NOTHING was stored; read the message.',
+          `Then call finalize_attachment_upload with attachment_id ${claims.a}.`,
+        ],
+      };
+    }),
+  );
+
+  server.tool(
+    'finalize_attachment_upload',
+    'Step 2 of 2. Confirms an upload from start_attachment_upload: re-reads the stored file and checks it is complete (size matches, content valid). Returns the attached file, or says plainly that it failed.',
+    { attachment_id: z.string().uuid() },
+    guard(async (a: any) => {
+      const r = await verifyStored(env, a.attachment_id);
+      if (!r.ok) {
+        throw new Error(
+          `Attachment ${a.attachment_id} is NOT usable: ${r.reason} Tell the user it failed; do not report success.`,
+        );
+      }
+      return { attached: true, ...r };
     }),
   );
 
